@@ -1553,3 +1553,27 @@ body:not([data-theme="light"]) .logo-main {
   gap: 8px;
   padding: 8px 0;
 }
+
+/* ─── Private Thread Visual Treatment ───────────────────── */
+.sms-thread-private {
+  border-color: rgba(212,175,55,0.3) !important;
+  background: rgba(212,175,55,0.03);
+}
+.sms-thread-private .sms-thread-title {
+  color: var(--accent);
+}
+
+/* ─── Owner Inbox Section Headers ────────────────────────── */
+.owner-inbox-section {
+  transition: box-shadow 0.2s;
+}
+.owner-inbox-section:hover {
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+}
+
+/* ─── Floor Plan ─────────────────────────────────────────── */
+.floor-plan-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+}
