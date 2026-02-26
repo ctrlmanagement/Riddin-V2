@@ -113,7 +113,18 @@ let STAFF_LIST = [];
 // Mock SMS threads (Phase 2: from Supabase/Twilio)
 let SMS_THREADS = [];
 
-// ─── Thread Tag System ────────────────────────────────────
+// ─── Thread Types (routing + bucketing) ──────────────────
+// Type drives who sees the thread and which inbox section it lands in.
+// Separate from display tag (color label).
+// PRIVATE: only owner + one specific member or staff member
+// RESERVATION: owner + manager + vip-host (pre-sat)
+// FLOOR: owner + assigned waitress + all barbacks (post-sat)
+// SECURITY: owner + doorman + manager + vip-host
+// MANAGEMENT: owner + manager + vip-host
+// GENERAL: owner only — catch-all, AI-filtered later
+const THREAD_TYPES = ['PRIVATE','RESERVATION','FLOOR','SECURITY','MANAGEMENT','GENERAL'];
+
+// ─── Thread Tag System (display/color only) ───────────────
 // Tags: GENERAL | RESERVATION | VIP | FLOOR | SECURITY | MANAGEMENT
 const THREAD_TAGS = ['GENERAL','RESERVATION','VIP','FLOOR','SECURITY','MANAGEMENT'];
 
@@ -134,7 +145,8 @@ const MEMBER_MSG_DESTINATIONS = [
     id:             'owner',
     label:          'Message Owner',
     icon:           '👤',
-    tag:            'MANAGEMENT',
+    tag:            'GENERAL',
+    type:           'PRIVATE',        // creates a private 1:1 thread with owner
     recipientRoles: ['owner'],
     color:          '#D4AF37',
     placeholder:    'Message the owner directly...',
@@ -144,6 +156,7 @@ const MEMBER_MSG_DESTINATIONS = [
     label:          'Message Management',
     icon:           '📋',
     tag:            'MANAGEMENT',
+    type:           'MANAGEMENT',
     recipientRoles: ['owner','manager','vip-host'],
     color:          '#60A5FA',
     placeholder:    'Message management team...',
@@ -153,6 +166,7 @@ const MEMBER_MSG_DESTINATIONS = [
     label:          'Message Wait Staff',
     icon:           '🥂',
     tag:            'FLOOR',
+    type:           'FLOOR',
     recipientRoles: ['waitress','barback','owner'],
     color:          '#34D399',
     placeholder:    'Message your server or bar staff...',
@@ -162,6 +176,7 @@ const MEMBER_MSG_DESTINATIONS = [
     label:          'Message Security',
     icon:           '🚨',
     tag:            'SECURITY',
+    type:           'SECURITY',
     recipientRoles: ['doorman','manager','vip-host','owner'],
     color:          '#EF4444',
     placeholder:    'Alert security team...',
@@ -200,12 +215,104 @@ function autoTagMessage(text) {
 function defaultRecipientRolesForTag(tag) {
   switch(tag) {
     case 'SECURITY':    return ['doorman','manager','vip-host','owner'];
-    case 'FLOOR':       return ['waitress','barback','owner'];
+    case 'FLOOR':       return ['barback','owner']; // waitress controlled via waitressId on thread
     case 'RESERVATION': return ['owner','manager','vip-host'];
     case 'VIP':         return ['vip-host','owner'];
     case 'MANAGEMENT':  return ['manager','vip-host','owner'];
-    default:            return ['owner','manager','vip-host'];
+    default:            return ['owner']; // GENERAL = owner only
   }
+}
+
+// Derive recipientRoles from thread type
+function defaultRecipientRolesForType(type) {
+  switch(type) {
+    case 'SECURITY':    return ['doorman','manager','vip-host','owner'];
+    case 'FLOOR':       return ['barback','owner']; // waitress via waitressId
+    case 'RESERVATION': return ['owner','manager','vip-host'];
+    case 'MANAGEMENT':  return ['manager','vip-host','owner'];
+    case 'PRIVATE':     return ['owner']; // + specific participant via privateParticipantId
+    case 'GENERAL':     return ['owner']; // owner only catch-all
+    default:            return ['owner'];
+  }
+}
+
+// Build a display name for a thread from its type
+function defaultThreadNameForType(type, memberOrStaffName, tableNum) {
+  const name = memberOrStaffName || 'Guest';
+  switch(type) {
+    case 'FLOOR':       return `${name}${tableNum ? ' — Table ' + tableNum : ''}`;
+    case 'PRIVATE':     return `Message with ${name}`;
+    case 'RESERVATION': return `Reservation — ${name}`;
+    case 'SECURITY':    return `Security Alert`;
+    case 'MANAGEMENT':  return `Management`;
+    case 'GENERAL':     return `General`;
+    default:            return name;
+  }
+}
+
+// ─── Floor Plan State ─────────────────────────────────────
+// Derived from RESERVATION_QUEUE at render time; selectedFloorTable
+// is used during the "mark as sat" workflow to capture a tap on the grid.
+let selectedFloorTable = {}; // keyed by resId → tableNum (number 1-10)
+
+function getFloorTableStatus(tableNum) {
+  const sat = RESERVATION_QUEUE.find(r =>
+    r.status === 'sat' && r.tableAssigned && r.tableAssigned.toString() === tableNum.toString()
+  );
+  if (sat) return { status: 'sat', memberName: sat.memberName };
+  const confirmed = RESERVATION_QUEUE.find(r =>
+    r.status === 'confirmed' && r.tableAssigned && r.tableAssigned.toString() === tableNum.toString()
+  );
+  if (confirmed) return { status: 'reserved', memberName: confirmed.memberName };
+  return { status: 'available' };
+}
+
+function renderFloorPlan(context, resId) {
+  // context: 'select' (clickable, for sat workflow) | 'view' (read-only overview)
+  const selTable = resId ? selectedFloorTable[resId] : null;
+  const tiles = [1,2,3,4,5,6,7,8,9,10].map(n => {
+    const info = getFloorTableStatus(n);
+    const isSelected = selTable === n;
+    let border = 'var(--border)', bg = 'var(--bg2)', textColor = 'var(--muted)', sub = '';
+    if (info.status === 'sat') {
+      border = '#34D399'; bg = '#34D39912'; textColor = '#34D399';
+      sub = `<div style="font-size:7px;color:#34D399;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:44px">${(info.memberName||'').split(' ')[0]}</div>`;
+    } else if (info.status === 'reserved') {
+      border = 'var(--acid)'; bg = 'rgba(245,200,66,0.08)'; textColor = 'var(--acid)';
+      sub = `<div style="font-size:7px;color:var(--acid);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:44px">${(info.memberName||'').split(' ')[0]}</div>`;
+    }
+    if (isSelected) { border = 'var(--accent)'; bg = 'rgba(212,175,55,0.18)'; }
+    const canClick = context === 'select' && info.status !== 'sat';
+    return `<div
+      onclick="${canClick ? `selectFloorTable(${n},'${resId}')` : ''}"
+      style="border:1px solid ${border};background:${bg};border-radius:8px;padding:8px 4px 6px;text-align:center;cursor:${canClick?'pointer':'default'};transition:all 0.15s${isSelected?';box-shadow:0 0 0 2px var(--accent)60':''}"
+    >
+      <div style="font-family:'Space Mono',monospace;font-size:11px;font-weight:700;color:${textColor}">${n}</div>
+      ${sub}
+    </div>`;
+  }).join('');
+
+  const hint = context === 'select'
+    ? (selTable
+        ? `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--accent);text-align:center;margin-top:8px">Table ${selTable} selected ✓</div>`
+        : `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);text-align:center;margin-top:8px">Tap a table to assign</div>`)
+    : '';
+
+  return `<div>
+    <div style="font-family:'Space Mono',monospace;font-size:8px;color:var(--muted);letter-spacing:0.1em;margin-bottom:8px">FLOOR PLAN — TABLES 1–10</div>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px">${tiles}</div>
+    ${hint}
+  </div>`;
+}
+
+function selectFloorTable(tableNum, resId) {
+  if (!resId) return;
+  const info = getFloorTableStatus(tableNum);
+  if (info.status === 'sat') return showToast('Table ' + tableNum + ' is already sat');
+  selectedFloorTable[resId] = tableNum;
+  // Re-render just the floor plan section for this reservation
+  const fp = document.getElementById(`floor-plan-${resId}`);
+  if (fp) fp.innerHTML = renderFloorPlan('select', resId);
 }
 
 // ─── 2FA / Device Trust ───────────────────────────────────
@@ -816,6 +923,19 @@ function setupStaffPortalForRole(role, staffObj) {
   const perksArea = document.getElementById('staff-perks-area');
   const ptsArea = document.getElementById('staff-pts-area');
 
+  // Always reset reservations area — only manager/vip-host will re-enable it below
+  const resAreaReset = document.getElementById('staff-reservations-area');
+  if (resAreaReset) resAreaReset.style.display = 'none';
+
+  // Clear any lingering member search result on every role switch
+  clearStaffMemberResult();
+
+  // Role-gate manual lookup — only manager and vip-host can text-search
+  const lookupDiv = document.getElementById('staff-lookup-area');
+  if (lookupDiv) {
+    lookupDiv.style.display = ['manager','vip-host'].includes(role) ? 'block' : 'none';
+  }
+
   labelEl.textContent = ROLE_LABELS[role] || role;
   badgeEl.textContent = (ROLE_LABELS[role] || role).toUpperCase();
   badgeEl.className = `role-badge ${role}`;
@@ -833,7 +953,8 @@ function setupStaffPortalForRole(role, staffObj) {
 
   // Role capabilities:
   // barback: read all SMS, no scan, no respond
-  // bartender/host: scan only, no SMS
+  // bartender: scan + private owner messages only
+  // host: scan only, no SMS
   // waitress: scan + respond only to assigned section SMS
   // vip-host/manager: scan + all SMS + respond
   // security: scan + security alert SMS only
@@ -846,11 +967,17 @@ function setupStaffPortalForRole(role, staffObj) {
       renderSMSThreads(role);
       break;
     case 'bartender':
+      scanArea.style.display = 'block';
+      smsArea.style.display = 'block';
+      if (perksArea) perksArea.style.display = 'block';
+      if (ptsArea) ptsArea.style.display = 'none';
+      renderSMSThreads('bartender');
+      break;
     case 'host':
       scanArea.style.display = 'block';
       smsArea.style.display = 'none';
       if (perksArea) perksArea.style.display = 'block';
-      if (ptsArea) ptsArea.style.display = 'none'; // bartenders don't add points
+      if (ptsArea) ptsArea.style.display = 'none';
       break;
     case 'waitress':
       scanArea.style.display = 'block';
@@ -869,6 +996,8 @@ function setupStaffPortalForRole(role, staffObj) {
       scanArea.style.display = 'block';
       smsArea.style.display = 'block';
       renderSMSThreads(role);
+      const resArea = document.getElementById('staff-reservations-area');
+      if (resArea) { resArea.style.display = 'block'; renderStaffReservations(); }
       break;
   }
 
@@ -890,15 +1019,12 @@ function setupStaffPortalForRole(role, staffObj) {
 
 function renderSMSThreads(role, assignedSection) {
   const container = document.getElementById('staff-sms-threads');
-  // Roles that can see security alerts
   const securityAlertRoles = ['owner', 'manager', 'vip-host', 'doorman'];
-  // Roles that can reply
   const canReply = ['waitress', 'vip-host', 'manager', 'doorman', 'owner'].includes(role);
   const readOnly = role === 'barback';
-  // Roles that can start a new thread (existing members only)
   const canInitiate = ['owner', 'manager', 'vip-host'].includes(role);
 
-  // Doorman: security-alert compose button injected above threads
+  // ── Doorman security compose ──
   const securityComposeId = 'doorman-security-compose';
   let securityComposeHtml = '';
   if (role === 'doorman') {
@@ -916,12 +1042,32 @@ function renderSMSThreads(role, assignedSection) {
       </div>`;
   }
 
-  // New thread button for owner/manager/vip-host
+  // ── Message Owner button (all non-owner staff) ──
+  let msgOwnerHtml = '';
+  if (role !== 'owner') {
+    const staffObj = STAFF_LIST.find(s => s.id === currentLoggedStaffId);
+    const staffName = staffObj?.name || ROLE_LABELS[role] || role;
+    msgOwnerHtml = `
+      <div style="margin-bottom:16px">
+        <button class="cal-save-btn" style="border-color:var(--accent);color:var(--accent);width:100%" onclick="toggleStaffOwnerCompose()">
+          👤 Message Owner
+        </button>
+        <div id="staff-owner-compose-area" style="display:none;margin-top:10px;background:var(--bg2);border:1px solid var(--accent);border-radius:10px;padding:14px">
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:10px">PRIVATE MESSAGE — OWNER ONLY</div>
+          <textarea class="form-input" id="staff-owner-msg-input" rows="2" placeholder="Message the owner privately..." style="resize:none;width:100%;box-sizing:border-box;font-size:13px"></textarea>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button class="cal-save-btn" style="border-color:var(--accent);color:var(--accent);flex:1" onclick="sendStaffOwnerMessage()">Send</button>
+            <button class="cal-save-btn" style="flex:1" onclick="toggleStaffOwnerCompose()">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // ── New thread picker (owner/manager/vip-host) ──
   let newThreadHtml = '';
   if (canInitiate) {
-    // Build list of existing threads (members who have already messaged or have a thread)
     const existingMembers = SMS_THREADS
-      .filter(t => !t.isSecurityAlert && t.memberName)
+      .filter(t => !t.isSecurityAlert && t.memberName && t.type !== 'PRIVATE')
       .map(t => ({ id: t.id, memberId: t.memberId, name: t.memberName }));
     if (existingMembers.length) {
       newThreadHtml = `
@@ -943,26 +1089,48 @@ function renderSMSThreads(role, assignedSection) {
     }
   }
 
+  // ── Filter threads visible to this role ──
   let threads = SMS_THREADS.filter(t => {
-    // Determine effective recipientRoles — use stored value or derive from tag
+    const type = t.type;
     const recipients = t.recipientRoles || defaultRecipientRolesForTag(t.tag || 'GENERAL');
 
+    // PRIVATE threads: only visible to owner AND the specific participant
+    if (type === 'PRIVATE') {
+      if (role === 'owner') return true;
+      // Staff participant sees their own private thread
+      return t.privateParticipantRole === 'staff' && t.privateParticipantId === currentLoggedStaffId;
+    }
+
     // Security alerts
-    const isSecAlert = t.isSecurityAlert || t.tag === 'SECURITY';
+    const isSecAlert = t.isSecurityAlert || type === 'SECURITY' || t.tag === 'SECURITY';
     if (isSecAlert) return recipients.includes(role);
 
     // Doorman only sees security
     if (role === 'doorman') return false;
 
-    // Check if this role is in the thread's recipient list
+    // Check recipient list
     if (!recipients.includes(role)) return false;
 
-    // Waitress: additionally filter to threads assigned to her or her section
+    // Waitress: only see FLOOR threads assigned to her
     if (role === 'waitress') {
-      return t.waitressId === currentLoggedStaffId ||
-             (assignedSection && t.section === assignedSection) ||
-             (t.participants && t.participants.includes(currentLoggedStaffId)) ||
-             (t.recipientRoles && t.recipientRoles.includes('waitress'));
+      if (type === 'FLOOR' || t.tag === 'FLOOR') {
+        return t.waitressId === currentLoggedStaffId ||
+               (assignedSection && t.section === assignedSection) ||
+               (t.recipientRoles && t.recipientRoles.includes('waitress'));
+      }
+      return false;
+    }
+
+    // Barback: only sees FLOOR threads
+    if (role === 'barback') {
+      return type === 'FLOOR' || t.tag === 'FLOOR';
+    }
+
+    // Bartender: only sees PRIVATE threads the owner opened with them directly
+    if (role === 'bartender') {
+      return type === 'PRIVATE' &&
+             t.privateParticipantRole === 'staff' &&
+             t.privateParticipantId === currentLoggedStaffId;
     }
 
     return true;
@@ -973,7 +1141,6 @@ function renderSMSThreads(role, assignedSection) {
     const col = THREAD_TAG_COLORS[tag] || '#888';
     const pill = `<span style="font-family:'Space Mono',monospace;font-size:9px;padding:2px 7px;border-radius:4px;background:${col}22;color:${col};border:1px solid ${col}44;letter-spacing:0.05em">${tag}</span>`;
     if (!canRetag) return pill;
-    // Retag dropdown for owner/manager/vip-host
     const opts = THREAD_TAGS.map(tg => `<option value="${tg}" ${tg===tag?'selected':''}>${tg}</option>`).join('');
     return `<div style="display:inline-flex;align-items:center;gap:6px">
       ${pill}
@@ -981,16 +1148,23 @@ function renderSMSThreads(role, assignedSection) {
     </div>`;
   };
 
-  const canRetag = ['owner','manager','vip-host'].includes(role);
+  const canRetag = ['manager','vip-host'].includes(role); // not owner (owner uses move in their own panel)
 
   if (!threads.length) {
-    container.innerHTML = securityComposeHtml + newThreadHtml + `<div style="padding:20px 0;text-align:center;color:var(--muted);font-family:'Space Mono',monospace;font-size:11px">No messages in your queue</div>`;
+    container.innerHTML = securityComposeHtml + msgOwnerHtml + newThreadHtml +
+      `<div style="padding:20px 0;text-align:center;color:var(--muted);font-family:'Space Mono',monospace;font-size:11px">No messages in your queue</div>`;
     return;
   }
 
-  container.innerHTML = securityComposeHtml + newThreadHtml + threads.map(t => {
+  container.innerHTML = securityComposeHtml + msgOwnerHtml + newThreadHtml + threads.map(t => {
     const tag = t.tag || (t.isSecurityAlert ? 'SECURITY' : 'GENERAL');
-    const sectionTag = t.tableNum ? `<span style="color:var(--accent);font-family:'Space Mono',monospace;font-size:9px">${t.tableNum} · ${t.section || 'General'}</span>` : '';
+    const displayName = t.threadName || t.memberName || 'Unknown';
+    const sectionTag = t.tableNum
+      ? `<span style="color:var(--accent);font-family:'Space Mono',monospace;font-size:9px">${t.tableNum}</span>`
+      : '';
+    const privateLabel = t.type === 'PRIVATE'
+      ? `<span style="font-family:'Space Mono',monospace;font-size:8px;padding:1px 5px;border-radius:3px;background:rgba(212,175,55,0.12);border:1px solid rgba(212,175,55,0.3);color:var(--accent)">PRIVATE</span>`
+      : '';
     const msgs = t.messages.map(msg => {
       if (msg.from === 'internal') {
         return `<div style="padding:8px 12px;margin:4px 0;background:rgba(96,165,250,0.08);border-left:2px solid #60A5FA;border-radius:4px">
@@ -998,9 +1172,12 @@ function renderSMSThreads(role, assignedSection) {
           <div class="sms-msg-meta" style="margin-top:3px">Team · ${msg.time}</div>
         </div>`;
       }
-      return `<div class="sms-msg ${msg.from === 'staff' ? 'outbound' : ''}">
+      const senderLabel = msg.from === 'member' ? t.memberName
+        : msg.from === 'staff-member' ? (msg.senderName || 'Staff')
+        : 'You';
+      return `<div class="sms-msg ${(msg.from === 'staff' || msg.from === 'staff-member') ? 'outbound' : ''}">
         <div>${msg.text}</div>
-        <div class="sms-msg-meta">${msg.from === 'member' ? t.memberName : 'You'} · ${msg.time}</div>
+        <div class="sms-msg-meta">${senderLabel} · ${msg.time}</div>
       </div>`;
     }).join('');
     const replySection = canReply ? `
@@ -1009,13 +1186,14 @@ function renderSMSThreads(role, assignedSection) {
         <button class="sms-send-btn" onclick="sendSMSReply('${t.id}')">SEND</button>
       </div>` : (readOnly ? `<div class="readonly-notice">READ ONLY</div>` : '');
     return `
-      <div class="sms-thread">
+      <div class="sms-thread${t.type === 'PRIVATE' ? ' sms-thread-private' : ''}">
         <div class="sms-thread-header">
           <div>
-            <div class="sms-thread-title">${t.memberName}</div>
+            <div class="sms-thread-title">${displayName}</div>
             <div style="margin-top:5px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
               ${tagPill(tag, t.id, canRetag)}
               ${sectionTag}
+              ${privateLabel}
             </div>
           </div>
           ${tag === 'SECURITY' ? '<span style="color:var(--error);font-family:Space Mono,monospace;font-size:9px">⚠ ALERT</span>' : ''}
@@ -1026,25 +1204,79 @@ function renderSMSThreads(role, assignedSection) {
   }).join('');
 }
 
-// ─── Retag Thread (Owner / Manager / VIP Host) ────────────
+// ─── Staff → Owner Private Message ────────────────────────
+function toggleStaffOwnerCompose() {
+  const area = document.getElementById('staff-owner-compose-area');
+  if (!area) return;
+  area.style.display = area.style.display === 'none' ? 'block' : 'none';
+  if (area.style.display === 'block') {
+    setTimeout(() => document.getElementById('staff-owner-msg-input')?.focus(), 50);
+  }
+}
+
+function sendStaffOwnerMessage() {
+  const text = document.getElementById('staff-owner-msg-input')?.value?.trim();
+  if (!text) return showToast('Enter a message');
+  const staffObj = STAFF_LIST.find(s => s.id === currentLoggedStaffId);
+  const staffName = staffObj?.name || ROLE_LABELS[currentStaffRole] || currentStaffRole || 'Staff';
+  const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+  // Find or create PRIVATE thread for this staff member → owner
+  const existing = SMS_THREADS.find(t =>
+    t.type === 'PRIVATE' &&
+    t.privateParticipantRole === 'staff' &&
+    t.privateParticipantId === currentLoggedStaffId
+  );
+  if (existing) {
+    existing.messages.push({ from: 'staff-member', text, time, senderName: staffName });
+  } else {
+    SMS_THREADS.push({
+      id:                   `PRIV-STAFF-${currentLoggedStaffId || currentStaffRole}-${Date.now()}`,
+      type:                 'PRIVATE',
+      threadName:           `Message with ${staffName}`,
+      memberId:             null,
+      memberName:           staffName,
+      memberPhone:          null,
+      privateParticipantId:   currentLoggedStaffId || ('ROLE-' + currentStaffRole),
+      privateParticipantRole: 'staff',
+      staffRole:            currentStaffRole,
+      section: null, tableNum: null,
+      isSecurityAlert: false,
+      tag:  'GENERAL',
+      recipientRoles: ['owner'],
+      messages: [{ from: 'staff-member', text, time, senderName: staffName }],
+    });
+  }
+  document.getElementById('staff-owner-msg-input').value = '';
+  toggleStaffOwnerCompose();
+  showToast('Message sent to owner');
+  renderSMSThreads(currentStaffRole, currentStaffSection);
+}
+
+// ─── Move Thread (Owner) — changes type, routing, name ────
+function moveThread(threadId, newType) {
+  const thread = SMS_THREADS.find(t => t.id === threadId);
+  if (!thread) return;
+  thread.type = newType;
+  thread.tag = newType;
+  thread.isSecurityAlert = (newType === 'SECURITY');
+  thread.recipientRoles = defaultRecipientRolesForType(newType);
+  thread.threadName = defaultThreadNameForType(newType, thread.memberName, thread.tableNum);
+  // FLOOR keeps its waitressId if one is set
+  showToast(`Thread moved → ${newType}`);
+  renderOwnerMessages();
+}
+
+// ─── Retag Thread (Manager / VIP Host — display tag only) ─
 function retagThread(threadId, newTag) {
   const thread = SMS_THREADS.find(t => t.id === threadId);
   if (!thread) return;
   thread.tag = newTag;
   thread.isSecurityAlert = (newTag === 'SECURITY');
+  // Also update recipientRoles to match new tag
   thread.recipientRoles = defaultRecipientRolesForTag(newTag);
   showToast(`Thread retagged → ${newTag}`);
   renderSMSThreads(currentStaffRole, currentStaffSection);
-}
-
-function retagThreadOwner(threadId, newTag) {
-  const thread = SMS_THREADS.find(t => t.id === threadId);
-  if (!thread) return;
-  thread.tag = newTag;
-  thread.isSecurityAlert = (newTag === 'SECURITY');
-  thread.recipientRoles = defaultRecipientRolesForTag(newTag);
-  showToast(`Thread retagged → ${newTag}`);
-  renderOwnerMessages();
 }
 
 // ─── Security Alert Compose (Doorman) ─────────────────────
@@ -1064,6 +1296,8 @@ function sendSecurityAlert() {
   const alertId = 'SEC-' + Date.now().toString().slice(-5);
   SMS_THREADS.push({
     id: alertId,
+    type: 'SECURITY',
+    threadName: `Security Alert — ${time}`,
     memberId: null,
     memberName: 'Security Alert',
     memberPhone: null,
@@ -1075,6 +1309,16 @@ function sendSecurityAlert() {
   });
   showToast('⚠ Security alert sent to Owner, Manager & VIP Host');
   renderSMSThreads('doorman');
+
+  // Force owner to Messages tab immediately so alert is visible without tab switch
+  const ownerScreen = document.getElementById('owner');
+  if (ownerScreen && ownerScreen.classList.contains('active')) {
+    const msgTab = document.querySelector('#owner .owner-tab[onclick*="messages"]');
+    if (msgTab) switchOwnerTab('messages', msgTab);
+  } else {
+    // Owner is not on owner screen — just keep messages fresh for when they get there
+    renderOwnerMessages();
+  }
 }
 
 // ─── New Thread Initiation (Owner / Manager / VIP Host) ───
@@ -1909,6 +2153,16 @@ async function staffLookup() {
   showStaffMember(normalizeRow(data));
 }
 
+function clearStaffMemberResult() {
+  const result = document.getElementById('staff-member-result');
+  if (result) result.style.display = 'none';
+  const search = document.getElementById('staff-search');
+  if (search) search.value = '';
+  currentMember = null;
+}
+
+let staffResultTimer = null;
+
 function showStaffMember(m) {
   currentMember = m;
   document.getElementById('staff-result-name').textContent = m.name;
@@ -1929,6 +2183,10 @@ function showStaffMember(m) {
     </div>`;
   }).join('');
   document.getElementById('staff-member-result').style.display = 'block';
+
+  // Auto-clear after 15 seconds so profile doesn't linger across staff sessions
+  if (staffResultTimer) clearTimeout(staffResultTimer);
+  staffResultTimer = setTimeout(() => clearStaffMemberResult(), 15000);
 }
 
 function staffRedeemPerk(id) {
@@ -2050,7 +2308,7 @@ function switchOwnerTab(tab, el) {
 function renderOwnerMessages() {
   const container = document.getElementById('owner-sms-threads');
 
-  // Owner new thread composer: search by phone, name, or staff name
+  // ── Composer area ──
   const composerArea = document.getElementById('owner-new-thread-area');
   if (composerArea) {
     composerArea.innerHTML = `
@@ -2064,33 +2322,51 @@ function renderOwnerMessages() {
         <div id="owner-compose-results" style="margin-bottom:10px"></div>
         <div id="owner-compose-recipient" style="display:none;margin-bottom:10px">
           <div id="owner-compose-recipient-label" style="font-family:'Space Mono',monospace;font-size:10px;color:#34D399;margin-bottom:8px"></div>
-          <select class="form-input" id="owner-compose-dest" style="font-family:'Space Mono',monospace;font-size:12px;margin-bottom:10px">
-            ${MEMBER_MSG_DESTINATIONS.map(d => `<option value="${d.id}">${d.label}</option>`).join('')}
-          </select>
           <textarea class="form-input" id="owner-compose-text" rows="2" placeholder="Your message..." style="resize:none;width:100%;box-sizing:border-box;font-size:13px;margin-bottom:8px"></textarea>
-          <button class="cal-save-btn" style="width:100%" onclick="ownerSendNewCompose()">Send Message</button>
+          <button class="cal-save-btn" style="width:100%" onclick="ownerSendNewCompose()">Send Private Message</button>
         </div>
       </div>`;
   }
 
-  const all = SMS_THREADS;
-  if (!all.length) {
+  // ── Build section config ──
+  const sections = [
+    { key: 'FLOOR',       label: '🪑 Tables Sat',       color: '#34D399' },
+    { key: 'RESERVATION', label: '📋 Reservations',      color: '#A78BFA' },
+    { key: 'SECURITY',    label: '🔒 Security',           color: '#EF4444' },
+    { key: 'PRIVATE',     label: '💬 Private Messages',  color: '#D4AF37' },
+    { key: 'MANAGEMENT',  label: '🏢 Management',         color: '#60A5FA' },
+    { key: 'GENERAL',     label: '📁 General',            color: '#888888' },
+  ];
+
+  // ── Categorize threads ──
+  const byType = {
+    FLOOR:       SMS_THREADS.filter(t => t.type === 'FLOOR'),
+    RESERVATION: SMS_THREADS.filter(t => t.type === 'RESERVATION'),
+    SECURITY:    SMS_THREADS.filter(t => t.type === 'SECURITY' || t.isSecurityAlert),
+    PRIVATE:     SMS_THREADS.filter(t => t.type === 'PRIVATE'),
+    MANAGEMENT:  SMS_THREADS.filter(t => t.type === 'MANAGEMENT'),
+    GENERAL:     SMS_THREADS.filter(t => !t.type || t.type === 'GENERAL'),
+  };
+
+  if (!SMS_THREADS.length) {
     container.innerHTML = `<div style="padding:20px 0;text-align:center;color:var(--muted);font-family:'Space Mono',monospace;font-size:11px">No messages yet tonight</div>`;
     return;
   }
-  container.innerHTML = all.map(t => {
-    const tag = t.tag || (t.isSecurityAlert ? 'SECURITY' : 'GENERAL');
-    const col  = THREAD_TAG_COLORS[tag] || '#888';
-    const tagPillHtml = `<span style="font-family:'Space Mono',monospace;font-size:9px;padding:2px 7px;border-radius:4px;background:${col}22;color:${col};border:1px solid ${col}44;letter-spacing:0.05em">${tag}</span>`;
-    const retagOpts = THREAD_TAGS.map(tg => `<option value="${tg}" ${tg===tag?'selected':''}>${tg}</option>`).join('');
-    const retagSelect = `<select onchange="retagThreadOwner('${t.id}',this.value)" style="font-family:'Space Mono',monospace;font-size:9px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--muted);padding:2px 4px;cursor:pointer">${retagOpts}</select>`;
-    const sectionTag = t.tableNum ? `<span style="color:var(--accent);font-family:'Space Mono',monospace;font-size:9px">${t.tableNum}</span>` : '';
-    const promoterTag = t.promoterId
-      ? `<span style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;border:1px solid #34D39940;padding:2px 6px;border-radius:4px">via ${(PROMOTER_LIST.find(p=>p.id===t.promoterId)||{}).name||t.promoterId}</span>`
+
+  // ── Move-to dropdown (owner control) ──
+  const moveOpts = THREAD_TYPES.map(t => `<option value="${t}">${t}</option>`).join('');
+
+  // ── Thread card renderer ──
+  const renderThreadCard = (t) => {
+    const displayName = t.threadName || t.memberName || 'Unknown';
+    const tableLabel = t.tableNum ? `<span style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);margin-right:4px">${t.tableNum}</span>` : '';
+    const waitressLabel = t.waitressName ? `<span style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399">👤 ${t.waitressName}</span>` : '';
+    const promoterLabel = t.promoterId
+      ? `<span style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;border:1px solid #34D39940;padding:1px 5px;border-radius:4px">via ${(PROMOTER_LIST.find(p=>p.id===t.promoterId)||{}).name||t.promoterId}</span>`
       : '';
-    const recipientBadges = (t.recipientRoles || []).map(r =>
-      `<span style="font-family:'Space Mono',monospace;font-size:8px;padding:1px 5px;border-radius:3px;background:var(--bg2);border:1px solid var(--border);color:var(--muted)">${r}</span>`
-    ).join('');
+    const privateLabel = t.type === 'PRIVATE'
+      ? `<span style="font-family:'Space Mono',monospace;font-size:8px;padding:1px 5px;border-radius:3px;background:rgba(212,175,55,0.12);border:1px solid rgba(212,175,55,0.3);color:var(--accent)">PRIVATE</span>`
+      : '';
     const msgs = t.messages.map(msg => {
       if (msg.from === 'internal') {
         return `<div style="padding:8px 12px;margin:4px 0;background:rgba(96,165,250,0.08);border-left:2px solid #60A5FA;border-radius:4px">
@@ -2098,30 +2374,82 @@ function renderOwnerMessages() {
           <div class="sms-msg-meta" style="margin-top:3px">Team · ${msg.time}</div>
         </div>`;
       }
-      return `<div class="sms-msg ${msg.from === 'staff' ? 'outbound' : ''}">
+      const senderLabel = msg.from === 'member' ? t.memberName
+        : msg.from === 'staff-member' ? (msg.senderName || 'Staff')
+        : 'You';
+      return `<div class="sms-msg ${(msg.from === 'staff' || msg.from === 'staff-member') ? 'outbound' : ''}">
         <div>${msg.text}</div>
-        <div class="sms-msg-meta">${msg.from === 'member' ? t.memberName : 'You'} · ${msg.time}</div>
+        <div class="sms-msg-meta">${senderLabel} · ${msg.time}</div>
       </div>`;
     }).join('');
+
     return `
-      <div class="sms-thread">
+      <div class="sms-thread${t.type === 'PRIVATE' ? ' sms-thread-private' : ''}">
         <div class="sms-thread-header">
-          <div>
-            <div class="sms-thread-title">${t.memberName}</div>
+          <div style="flex:1;min-width:0">
+            <div class="sms-thread-title">${displayName}</div>
             <div style="margin-top:5px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
-              ${tagPillHtml} ${retagSelect} ${sectionTag} ${promoterTag}
+              ${tableLabel}${waitressLabel}${promoterLabel}${privateLabel}
             </div>
-            ${recipientBadges ? `<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">${recipientBadges}</div>` : ''}
           </div>
-          ${tag === 'SECURITY' ? '<span style="color:var(--error);font-family:Space Mono,monospace;font-size:9px">⚠ ALERT</span>' : ''}
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0">
+            ${t.type === 'SECURITY' ? '<span style="color:var(--error);font-family:Space Mono,monospace;font-size:9px">⚠ ALERT</span>' : ''}
+            <select onchange="moveThread('${t.id}',this.value)"
+              style="font-family:'Space Mono',monospace;font-size:9px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--muted);padding:2px 4px;cursor:pointer">
+              <option value="">Move to...</option>
+              ${THREAD_TYPES.filter(tp => tp !== t.type).map(tp =>
+                `<option value="${tp}">${tp}</option>`
+              ).join('')}
+            </select>
+          </div>
         </div>
         <div class="sms-messages">${msgs}</div>
         <div class="sms-reply-row">
-          <input class="sms-reply-input" id="owner-sms-reply-${t.id}" placeholder="Reply as owner..." type="text" onkeydown="if(event.key==='Enter')ownerSendReply('${t.id}')">
+          <input class="sms-reply-input" id="owner-sms-reply-${t.id}" placeholder="Reply as owner..." type="text"
+            onkeydown="if(event.key==='Enter')ownerSendReply('${t.id}')">
           <button class="sms-send-btn" onclick="ownerSendReply('${t.id}')">SEND</button>
         </div>
       </div>`;
-  }).join('');
+  };
+
+  // ── Render sections ──
+  let html = '';
+  sections.forEach(sec => {
+    const threads = byType[sec.key] || [];
+    const count = threads.length;
+    const sectionId = `owner-inbox-section-${sec.key}`;
+    const bodyId = `owner-inbox-body-${sec.key}`;
+    const isOpen = count > 0; // default: open if has threads
+
+    html += `
+      <div class="owner-inbox-section" id="${sectionId}" style="margin-bottom:12px;border:1px solid var(--border);border-radius:10px;overflow:hidden">
+        <div onclick="toggleOwnerInboxSection('${bodyId}')"
+          style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:var(--bg2);cursor:pointer">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-family:'Space Mono',monospace;font-size:10px;color:${sec.color}">${sec.label}</span>
+            <span style="font-family:'Space Mono',monospace;font-size:9px;padding:1px 7px;border-radius:10px;background:${sec.color}20;color:${sec.color};border:1px solid ${sec.color}40">${count}</span>
+          </div>
+          <span id="${bodyId}-caret" style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">${isOpen ? '▲' : '▼'}</span>
+        </div>
+        <div id="${bodyId}" style="display:${isOpen ? 'block' : 'none'};padding:${count ? '12px' : '0'}">
+          ${count
+            ? threads.map(renderThreadCard).join('')
+            : `<div style="padding:12px;text-align:center;color:var(--dim);font-family:'Space Mono',monospace;font-size:10px">Empty</div>`
+          }
+        </div>
+      </div>`;
+  });
+
+  container.innerHTML = html;
+}
+
+function toggleOwnerInboxSection(bodyId) {
+  const body = document.getElementById(bodyId);
+  const caret = document.getElementById(bodyId + '-caret');
+  if (!body) return;
+  const isOpen = body.style.display !== 'none';
+  body.style.display = isOpen ? 'none' : 'block';
+  if (caret) caret.textContent = isOpen ? '▼' : '▲';
 }
 
 let ownerComposeTarget = null; // { memberId, memberName, memberPhone } or { isStaff, staffId, staffName }
@@ -2173,20 +2501,47 @@ function ownerSendNewCompose() {
   if (!ownerComposeTarget) return showToast('Search and select a recipient first');
   const text = document.getElementById('owner-compose-text')?.value?.trim();
   if (!text) return showToast('Enter a message');
-  const destId = document.getElementById('owner-compose-dest')?.value;
-  const dest = MEMBER_MSG_DESTINATIONS.find(d => d.id === destId) || MEMBER_MSG_DESTINATIONS[0];
   const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
 
   if (ownerComposeTarget.type === 'member') {
-    const member = members.find(m => m.id === ownerComposeTarget.id) || { id: ownerComposeTarget.id, name: ownerComposeTarget.name, phone: ownerComposeTarget.phone };
-    // Push to member thread
+    const member = members.find(m => m.id === ownerComposeTarget.id) ||
+      { id: ownerComposeTarget.id, name: ownerComposeTarget.name, phone: ownerComposeTarget.phone };
+
+    // Always PRIVATE when owner initiates with a member
     getMemberThread(member.id).push({ from: 'staff', text, time });
-    // Push to SMS_THREADS
-    pushToStaffThread(member, text, dest.tag, dest.recipientRoles, time, 'staff');
-    showToast(`Message sent to ${ownerComposeTarget.name}`);
+    pushToStaffThread(member, text, 'GENERAL', ['owner'], time, 'staff', 'PRIVATE');
+    showToast(`Private message sent to ${ownerComposeTarget.name}`);
+
   } else {
-    // Staff-to-staff internal message — just show as internal thread note
-    showToast(`Internal message sent to ${ownerComposeTarget.name}`);
+    // Staff: create PRIVATE thread
+    const staffObj = STAFF_LIST.find(s => s.id === ownerComposeTarget.id);
+    const staffName = staffObj?.name || ownerComposeTarget.name;
+    const existing = SMS_THREADS.find(t =>
+      t.type === 'PRIVATE' &&
+      t.privateParticipantRole === 'staff' &&
+      t.privateParticipantId === ownerComposeTarget.id
+    );
+    if (existing) {
+      existing.messages.push({ from: 'staff', text, time }); // 'staff' here = owner reply
+    } else {
+      SMS_THREADS.push({
+        id:                   `PRIV-STAFF-${ownerComposeTarget.id}-${Date.now()}`,
+        type:                 'PRIVATE',
+        threadName:           `Message with ${staffName}`,
+        memberId:             null,
+        memberName:           staffName,
+        memberPhone:          null,
+        privateParticipantId:   ownerComposeTarget.id,
+        privateParticipantRole: 'staff',
+        staffRole:            staffObj?.role || null,
+        section: null, tableNum: null,
+        isSecurityAlert: false,
+        tag: 'GENERAL',
+        recipientRoles: ['owner'],
+        messages: [{ from: 'staff', text, time }],
+      });
+    }
+    showToast(`Private message sent to ${staffName}`);
   }
 
   // Reset
@@ -2201,10 +2556,16 @@ function ownerSendReply(threadId) {
   const input = document.getElementById(`owner-sms-reply-${threadId}`);
   if (!input || !input.value.trim()) return;
   const thread = SMS_THREADS.find(t => t.id === threadId);
+  const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
   if (thread) {
-    thread.messages.push({ from: 'staff', text: input.value.trim(), time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) });
+    thread.messages.push({ from: 'staff', text: input.value.trim(), time });
+    // Push reply back to member's concierge thread if this is a member thread
+    if (thread.memberId && thread.privateParticipantRole !== 'staff') {
+      getMemberThread(thread.memberId).push({ from: 'staff', text: input.value.trim(), time });
+    }
     showToast('Message sent');
   }
+  input.value = '';
   renderOwnerMessages();
 }
 
@@ -2612,38 +2973,96 @@ function sendMemberMessage() {
   thread.push({ from: 'member', text, time, destination: currentMsgDestination.id });
   input.value = '';
 
-  // Push to staff SMS_THREADS with correct routing
-  pushToStaffThread(currentMember, text, currentMsgDestination.tag, currentMsgDestination.recipientRoles, time);
+  // Push to staff SMS_THREADS with type from destination
+  pushToStaffThread(
+    currentMember, text,
+    currentMsgDestination.tag,
+    currentMsgDestination.recipientRoles,
+    time,
+    'member',
+    currentMsgDestination.type  // pass explicit type (PRIVATE for owner dest)
+  );
 
   renderMemberMessageThread();
   showToast(`Message sent to ${currentMsgDestination.label}`);
 }
 
 // Central helper: push a message into the correct SMS_THREADS entry for staff
-function pushToStaffThread(member, text, tag, recipientRoles, time, fromType) {
+function pushToStaffThread(member, text, tag, recipientRoles, time, fromType, forceType) {
   const from = fromType || 'member';
-  const isSecAlert = tag === 'SECURITY';
 
-  // For non-owner destinations, find or create a thread keyed by memberId + destination context
-  // For simplicity we keep one thread per member but track recipientRoles on the thread
-  const existing = SMS_THREADS.find(t => t.memberId === member.id && !t.isSecurityAlert && t.tag === tag);
+  // Determine thread type
+  let type = forceType || (() => {
+    if (tag === 'SECURITY')    return 'SECURITY';
+    if (tag === 'FLOOR')       return 'FLOOR';
+    if (tag === 'RESERVATION') return 'RESERVATION';
+    if (tag === 'MANAGEMENT')  return 'MANAGEMENT';
+    return 'GENERAL';
+  })();
+
+  const isSecAlert = type === 'SECURITY';
+
+  // ── PRIVATE threads: never merge with other threads ────
+  if (type === 'PRIVATE') {
+    const existing = SMS_THREADS.find(t =>
+      t.type === 'PRIVATE' &&
+      t.memberId === member.id &&
+      t.privateParticipantRole === 'member'
+    );
+    if (existing) {
+      existing.messages.push({ from, text, time });
+    } else {
+      SMS_THREADS.push({
+        id:                   `PRIV-${member.id}-${Date.now()}`,
+        type:                 'PRIVATE',
+        threadName:           `Message with ${member.name}`,
+        memberId:             member.id,
+        memberName:           member.name,
+        memberPhone:          member.phone || '',
+        privateParticipantId:   member.id,
+        privateParticipantRole: 'member',
+        section: null, tableNum: null,
+        isSecurityAlert: false,
+        tag:  'GENERAL',
+        recipientRoles: ['owner'],
+        messages: [{ from, text, time }],
+      });
+    }
+    return;
+  }
+
+  // ── All other types: find or create keyed by memberId + type ──
+  const existing = SMS_THREADS.find(t =>
+    t.memberId === member.id &&
+    !t.isSecurityAlert &&
+    ((t.type === type) || (!t.type && t.tag === tag))
+  );
   if (existing) {
     existing.messages.push({ from, text, time });
-    // Expand recipientRoles if needed (e.g. reservation later adds waitress)
+    if (!existing.type) {
+      existing.type = type;
+      existing.threadName = defaultThreadNameForType(type, member.name, existing.tableNum);
+    }
+    // Expand recipientRoles if needed
     if (recipientRoles) {
-      recipientRoles.forEach(r => { if (!existing.recipientRoles.includes(r)) existing.recipientRoles.push(r); });
+      recipientRoles.forEach(r => {
+        if (!existing.recipientRoles.includes(r)) existing.recipientRoles.push(r);
+      });
     }
   } else {
+    const roles = recipientRoles || defaultRecipientRolesForType(type);
     SMS_THREADS.push({
-      id:             `M-${member.id}-${tag}-${Date.now()}`,
+      id:             `M-${member.id}-${type}-${Date.now()}`,
+      type,
+      threadName:     defaultThreadNameForType(type, member.name, null),
       memberId:       member.id,
       memberName:     member.name,
       memberPhone:    member.phone || '',
       section:        null,
       tableNum:       null,
       isSecurityAlert: isSecAlert,
-      tag,
-      recipientRoles: recipientRoles || defaultRecipientRolesForTag(tag),
+      tag:            tag || type,
+      recipientRoles: roles,
       messages:       [{ from, text, time }],
     });
   }
@@ -2689,8 +3108,8 @@ function sendSMSReply(threadId) {
   const text = input.value.trim();
   thread.messages.push({ from: 'staff', text, time });
   input.value = '';
-  // Push reply back into the member's own thread
-  if (thread.memberId) {
+  // Push reply back into the member's own thread (not for staff-to-staff PRIVATE threads)
+  if (thread.memberId && thread.privateParticipantRole !== 'staff') {
     const memberThread = getMemberThread(thread.memberId);
     memberThread.push({ from: 'staff', text, time });
   }
@@ -2998,24 +3417,26 @@ function logSaleAndFireThread(sale) {
     thread.push({ from: 'staff', text: msg, time });
 
     // Mirror into SMS_THREADS so staff can reply
-    const existing = SMS_THREADS.find(t => t.memberId === sale.memberId);
-    if (existing) {
-      existing.messages.push({ from: 'staff', text: msg, time });
-      if (sale.tableAssigned) existing.tableNum = sale.tableAssigned;
-      existing.promoterId = sale.promoterId || existing.promoterId;
+    const existingThread = SMS_THREADS.find(t => t.memberId === sale.memberId && t.type === 'RESERVATION');
+    if (existingThread) {
+      existingThread.messages.push({ from: 'staff', text: msg, time });
+      if (sale.tableAssigned) existingThread.tableNum = sale.tableAssigned;
+      existingThread.promoterId = sale.promoterId || existingThread.promoterId;
     } else {
       SMS_THREADS.push({
-        id:         `M-${sale.memberId}-RES`,
-        memberId:   sale.memberId,
-        memberName: sale.memberName,
-        memberPhone: sale.memberPhone,
-        section:    null,
-        tableNum:   sale.tableAssigned || null,
+        id:             `M-${sale.memberId}-RES`,
+        type:           'RESERVATION',
+        threadName:     `Reservation — ${sale.memberName}`,
+        memberId:       sale.memberId,
+        memberName:     sale.memberName,
+        memberPhone:    sale.memberPhone,
+        section:        null,
+        tableNum:       sale.tableAssigned || null,
         isSecurityAlert: false,
-        tag:        'RESERVATION',
+        tag:            'RESERVATION',
         recipientRoles: ['owner','manager','vip-host'],
-        promoterId: sale.promoterId,
-        messages:   [{ from: 'staff', text: msg, time }],
+        promoterId:     sale.promoterId,
+        messages:       [{ from: 'staff', text: msg, time }],
       });
     }
   }
@@ -3037,15 +3458,27 @@ function renderOwnerReservations() {
 
   const waitresses = STAFF_LIST.filter(s => s.role === 'waitress' && s.active);
 
+  // Floor plan overview — read-only at top
+  const floorOverview = `
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px">
+      ${renderFloorPlan('view', null)}
+      <div style="display:flex;gap:12px;margin-top:10px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:var(--bg2);border:1px solid var(--border)"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:var(--muted)">AVAILABLE</span></div>
+        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:rgba(245,200,66,0.08);border:1px solid var(--acid)"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:var(--acid)">RESERVED</span></div>
+        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:#34D39912;border:1px solid #34D399"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:#34D399">SAT</span></div>
+      </div>
+    </div>`;
+
   const renderRes = (r) => {
     const statusColor = r.status === 'sat' ? '#34D399' : r.status === 'confirmed' ? '#60A5FA' : 'var(--acid)';
+    const selTable = selectedFloorTable[r.id];
     return `
     <div class="sms-thread" style="margin-bottom:12px">
       <div class="sms-thread-header">
         <div>
           <div class="sms-thread-title">${r.memberName}</div>
           <div class="sms-msg-meta" style="margin-top:3px">${r.partySize} guests · ${r.occasion} · ${r.eventName || 'General'}</div>
-          ${r.tableAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);margin-top:2px">📍 ${r.tableAssigned}</div>` : ''}
+          ${r.tableAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);margin-top:2px">📍 Table ${r.tableAssigned}</div>` : ''}
           ${r.waitressAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;margin-top:2px">👤 ${STAFF_LIST.find(s=>s.id===r.waitressAssigned)?.name || 'Server assigned'}</div>` : ''}
         </div>
         <span style="font-family:'Space Mono',monospace;font-size:9px;padding:3px 8px;border-radius:4px;background:${statusColor}18;color:${statusColor};border:1px solid ${statusColor}40">${r.status.toUpperCase()}</span>
@@ -3053,22 +3486,27 @@ function renderOwnerReservations() {
       ${r.notes ? `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-top:6px">"${r.notes}"</div>` : ''}
 
       ${r.status === 'pending' ? `
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
-          <input class="form-input" style="flex:1;min-width:100px;padding:8px;font-size:11px" id="res-table-${r.id}" placeholder="Table # e.g. Table 4" value="${r.tableAssigned||''}">
+        <div style="margin-top:12px">
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:6px">Optionally pre-assign a table:</div>
+          <input class="form-input" style="padding:8px;font-size:11px;margin-bottom:10px" id="res-table-${r.id}" placeholder="Table # (optional)" value="${r.tableAssigned||''}">
         </div>
-        <div style="display:flex;gap:8px;margin-top:8px">
+        <div style="display:flex;gap:8px;margin-top:4px">
           <button class="cal-save-btn" onclick="acceptReservation('${r.id}')">Accept &amp; Notify Team</button>
           <button class="cal-save-btn" style="border-color:var(--error);color:var(--error)" onclick="declineReservation('${r.id}')">Decline</button>
         </div>` : ''}
 
       ${r.status === 'confirmed' ? `
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
-          <select class="form-input" style="flex:1;min-width:140px;padding:8px;font-size:11px;font-family:'Space Mono',monospace" id="res-waitress-${r.id}">
+        <div style="margin-top:12px">
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:8px">ASSIGN TABLE — TAP TO SELECT</div>
+          <div id="floor-plan-${r.id}" style="margin-bottom:12px">
+            ${renderFloorPlan('select', r.id)}
+          </div>
+          <select class="form-input" style="padding:8px;font-size:11px;font-family:'Space Mono',monospace;margin-bottom:10px" id="res-waitress-${r.id}">
             <option value="">Assign waitress...</option>
             ${waitresses.map(w => `<option value="${w.id}" ${r.waitressAssigned===w.id?'selected':''}>${w.name}</option>`).join('')}
           </select>
         </div>
-        <div style="display:flex;gap:8px;margin-top:8px">
+        <div style="display:flex;gap:8px;margin-top:4px">
           <button class="cal-save-btn" style="border-color:#34D399;color:#34D399" onclick="markTableSat('${r.id}')">🪑 Table Sat — Add Server</button>
         </div>` : ''}
 
@@ -3077,10 +3515,10 @@ function renderOwnerReservations() {
     </div>`;
   };
 
-  let html = '';
-  if (pending.length) html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--acid);letter-spacing:0.08em;margin-bottom:8px">PENDING (${pending.length})</div>` + pending.map(renderRes).join('');
+  let html = floorOverview;
+  if (pending.length)   html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--acid);letter-spacing:0.08em;margin-bottom:8px">PENDING (${pending.length})</div>` + pending.map(renderRes).join('');
   if (confirmed.length) html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#60A5FA;letter-spacing:0.08em;margin:16px 0 8px">CONFIRMED — AWAITING SEAT (${confirmed.length})</div>` + confirmed.map(renderRes).join('');
-  if (sat.length) html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;letter-spacing:0.08em;margin:16px 0 8px">SEATED (${sat.length})</div>` + sat.map(renderRes).join('');
+  if (sat.length)       html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;letter-spacing:0.08em;margin:16px 0 8px">SEATED (${sat.length})</div>` + sat.map(renderRes).join('');
   container.innerHTML = html;
 }
 
@@ -3099,14 +3537,17 @@ function acceptReservation(resId) {
     thread.push({ from: 'staff', text: confirmMsg, time });
 
     // Mirror to SMS_THREADS with owner + manager + vip-host access
-    const existing = SMS_THREADS.find(t => t.memberId === res.memberId && t.tag === 'RESERVATION');
+    const existing = SMS_THREADS.find(t => t.memberId === res.memberId && t.type === 'RESERVATION');
     if (existing) {
       existing.tableNum = res.tableAssigned || existing.tableNum;
+      existing.threadName = `Reservation — ${res.memberName}`;
       existing.messages.push({ from: 'staff', text: confirmMsg, time });
       existing.recipientRoles = ['owner','manager','vip-host'];
     } else {
       SMS_THREADS.push({
         id: `M-${res.memberId}-RES`, memberId: res.memberId,
+        type: 'RESERVATION',
+        threadName: `Reservation — ${res.memberName}`,
         memberName: res.memberName, memberPhone: res.memberPhone,
         section: null, tableNum: res.tableAssigned || null,
         isSecurityAlert: false,
@@ -3137,14 +3578,29 @@ function acceptReservation(resId) {
 function markTableSat(resId) {
   const res = RESERVATION_QUEUE.find(r => r.id === resId);
   if (!res) return;
+
+  // Table must be selected from the floor plan
+  const tableNum = selectedFloorTable[resId];
+  if (!tableNum) { showToast('Select a table from the floor plan first'); return; }
+
   const waitressId = document.getElementById(`res-waitress-${resId}`)?.value;
   if (!waitressId) { showToast('Assign a waitress before marking as sat'); return; }
 
-  res.waitressAssigned = waitressId;
-  res.status = 'sat';
-  const waitress = STAFF_LIST.find(s => s.id === waitressId);
+  // Check the table isn't already sat by someone else
+  const alreadySat = RESERVATION_QUEUE.find(r =>
+    r.id !== resId && r.status === 'sat' &&
+    r.tableAssigned && r.tableAssigned.toString() === tableNum.toString()
+  );
+  if (alreadySat) { showToast(`Table ${tableNum} is already sat — pick another table`); return; }
 
-  // Fire the full pipeline — stamps calendar + confirms details to member
+  res.waitressAssigned = waitressId;
+  res.tableAssigned    = tableNum.toString();
+  res.status           = 'sat';
+
+  const waitress = STAFF_LIST.find(s => s.id === waitressId);
+  const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+  // Fire the full pipeline
   const promoterEntry = SALES_LOG.find(s => s.memberId === res.memberId && s.type === 'table');
   logSaleAndFireThread({
     id: res.id, type: 'table',
@@ -3160,31 +3616,236 @@ function markTableSat(resId) {
     isComp:        promoterEntry?.isComp || false,
   });
 
-  // Move thread to waitress — update recipientRoles to include waitress, shift tag to FLOOR
-  const sThread = SMS_THREADS.find(t => t.memberId === res.memberId && t.tag === 'RESERVATION');
+  // Transition thread: RESERVATION → FLOOR
+  // Replace recipientRoles entirely: owner + barbacks only (waitress via waitressId)
+  const sThread = SMS_THREADS.find(t => t.memberId === res.memberId && t.type === 'RESERVATION');
   if (sThread && waitress) {
-    const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    sThread.type         = 'FLOOR';
+    sThread.tag          = 'FLOOR';
+    sThread.threadName   = `${res.memberName} — Table ${res.tableAssigned}`;
+    sThread.tableNum     = res.tableAssigned;
     sThread.waitressId   = waitress.id;
     sThread.waitressName = waitress.name;
-    sThread.tableNum     = res.tableAssigned || sThread.tableNum;
-    // Expand recipientRoles to include waitress so she sees the thread
-    if (!sThread.recipientRoles) sThread.recipientRoles = ['owner','manager','vip-host'];
-    if (!sThread.recipientRoles.includes('waitress')) sThread.recipientRoles.push('waitress');
-    if (!sThread.recipientRoles.includes('barback'))  sThread.recipientRoles.push('barback');
-    sThread.messages.push({ from: 'internal', text: `👋 ${waitress.name} has joined the thread as server for ${res.tableAssigned || 'this table'}. Party is seated.`, time });
+    // FLOOR recipientRoles: owner + all barbacks (specific IDs for barbacks, role for fallback)
+    sThread.recipientRoles = ['owner', 'barback'];
+    sThread.messages.push({
+      from: 'internal',
+      text: `🪑 Table ${res.tableAssigned} sat. ${waitress.name} is assigned as server. Barbacks notified.`,
+      time
+    });
   }
 
-  // Schedule next-morning 9 AM follow-up to member
+  // Schedule 9 AM follow-up
   const memberObj = members.find(m => m.id === res.memberId) || { id: res.memberId, name: res.memberName };
   scheduleFollowUp(memberObj, res.eventName);
 
-  showToast(`Table sat — ${waitress?.name || 'server'} added to thread · Follow-up scheduled for 9 AM`);
+  // Clear the floor plan selection for this res
+  delete selectedFloorTable[resId];
+
+  showToast(`Table ${res.tableAssigned} sat — ${waitress?.name || 'server'} in thread · Follow-up at 9 AM`);
   renderOwnerReservations();
+  renderStaffReservations();
 }
 
 function declineReservation(resId) {
   const idx = RESERVATION_QUEUE.findIndex(r => r.id === resId);
   if (idx >= 0) { RESERVATION_QUEUE.splice(idx, 1); showToast('Reservation declined'); renderOwnerReservations(); }
+}
+
+// ─── Manual Reservation Creation (Owner + Manager/VIP-Host) ──────────────
+function buildManualReservation(nameId, phoneId, sizeId, occasionId, notesId) {
+  const name     = document.getElementById(nameId)?.value?.trim();
+  const phone    = document.getElementById(phoneId)?.value?.trim() || null;
+  const size     = parseInt(document.getElementById(sizeId)?.value) || 0;
+  const occasion = document.getElementById(occasionId)?.value || 'General visit';
+  const notes    = document.getElementById(notesId)?.value?.trim() || '';
+  if (!name)    { showToast('Enter a guest name'); return null; }
+  if (size < 1) { showToast('Enter party size'); return null; }
+
+  const resId  = 'RES' + Date.now().toString().slice(-5);
+  const today  = new Date();
+  const dateKey = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+
+  // Try to find an existing member by phone or name
+  const existing = members.find(m =>
+    (phone && m.phone === phone) ||
+    m.name.toLowerCase() === name.toLowerCase()
+  );
+
+  return {
+    id:               resId,
+    memberName:       name,
+    memberId:         existing?.id || null,
+    memberPhone:      phone || existing?.phone || null,
+    dateKey,
+    eventName:        'Tonight',
+    partySize:        size,
+    occasion,
+    notes,
+    referredByPromoter: null,
+    status:           'confirmed',   // manual = already confirmed, skip pending
+    requestedAt:      Date.now(),
+    tableAssigned:    null,
+    waitressAssigned: null,
+  };
+}
+
+function ownerAddReservation() {
+  const res = buildManualReservation('owner-res-name','owner-res-phone','owner-res-size','owner-res-occasion','owner-res-notes');
+  if (!res) return;
+  RESERVATION_QUEUE.push(res);
+  // Clear form
+  ['owner-res-name','owner-res-phone','owner-res-size','owner-res-notes'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  showToast(`${res.memberName} — party of ${res.partySize} added`);
+  renderOwnerReservations();
+}
+
+function staffAddReservation() {
+  const res = buildManualReservation('staff-res-name','staff-res-phone','staff-res-size','staff-res-occasion','staff-res-notes');
+  if (!res) return;
+  RESERVATION_QUEUE.push(res);
+  ['staff-res-name','staff-res-phone','staff-res-size','staff-res-notes'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  showToast(`${res.memberName} — party of ${res.partySize} added`);
+  renderStaffReservations();
+  renderOwnerReservations(); // keep owner view in sync
+}
+
+// ─── Staff Reservation Queue (manager & vip-host — confirmed + sat only) ──
+function renderStaffReservations() {
+  const container = document.getElementById('staff-reservations-list');
+  if (!container) return;
+
+  const confirmed = RESERVATION_QUEUE.filter(r => r.status === 'confirmed');
+  const sat       = RESERVATION_QUEUE.filter(r => r.status === 'sat');
+
+  if (!confirmed.length && !sat.length) {
+    container.innerHTML = `<div style="padding:16px 0;text-align:center;color:var(--dim);font-family:'Space Mono',monospace;font-size:10px">No confirmed reservations</div>`;
+    return;
+  }
+
+  const waitresses = STAFF_LIST.filter(s => s.role === 'waitress' && s.active);
+
+  const floorOverview = `
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px">
+      ${renderFloorPlan('view', null)}
+      <div style="display:flex;gap:12px;margin-top:10px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:var(--bg2);border:1px solid var(--border)"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:var(--muted)">AVAILABLE</span></div>
+        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:rgba(245,200,66,0.08);border:1px solid var(--acid)"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:var(--acid)">RESERVED</span></div>
+        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:#34D39912;border:1px solid #34D399"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:#34D399">SAT</span></div>
+      </div>
+    </div>`;
+
+  const renderRes = (r) => {
+    const statusColor = r.status === 'sat' ? '#34D399' : '#60A5FA';
+    const selTable = selectedFloorTable[r.id];
+    return `
+    <div class="sms-thread" style="margin-bottom:12px">
+      <div class="sms-thread-header">
+        <div>
+          <div class="sms-thread-title">${r.memberName}</div>
+          <div class="sms-msg-meta" style="margin-top:3px">${r.partySize} guests · ${r.occasion} · ${r.eventName || 'General'}</div>
+          ${r.tableAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);margin-top:2px">📍 Table ${r.tableAssigned}</div>` : ''}
+          ${r.waitressAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;margin-top:2px">👤 ${STAFF_LIST.find(s=>s.id===r.waitressAssigned)?.name || 'Server assigned'}</div>` : ''}
+        </div>
+        <span style="font-family:'Space Mono',monospace;font-size:9px;padding:3px 8px;border-radius:4px;background:${statusColor}18;color:${statusColor};border:1px solid ${statusColor}40">${r.status.toUpperCase()}</span>
+      </div>
+      ${r.notes ? `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-top:6px">"${r.notes}"</div>` : ''}
+
+      ${r.status === 'confirmed' ? `
+        <div style="margin-top:12px">
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:8px">ASSIGN TABLE — TAP TO SELECT</div>
+          <div id="staff-floor-plan-${r.id}" style="margin-bottom:12px">
+            ${renderFloorPlan('select', r.id, 'staff')}
+          </div>
+          <select class="form-input" style="padding:8px;font-size:11px;font-family:'Space Mono',monospace;margin-bottom:10px" id="staff-res-waitress-${r.id}">
+            <option value="">Assign waitress...</option>
+            ${waitresses.map(w => `<option value="${w.id}" ${r.waitressAssigned===w.id?'selected':''}>${w.name}</option>`).join('')}
+          </select>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:4px">
+          <button class="cal-save-btn" style="border-color:#34D399;color:#34D399" onclick="markTableSatStaff('${r.id}')">🪑 Table Sat — Add Server</button>
+        </div>` : ''}
+
+      ${r.status === 'sat' ? `
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:#34D399;margin-top:8px">✓ Party seated · Server in thread</div>` : ''}
+    </div>`;
+  };
+
+  let html = floorOverview;
+  if (confirmed.length) html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#60A5FA;letter-spacing:0.08em;margin-bottom:8px">CONFIRMED — AWAITING SEAT (${confirmed.length})</div>` + confirmed.map(renderRes).join('');
+  if (sat.length)       html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;letter-spacing:0.08em;margin:16px 0 8px">SEATED (${sat.length})</div>` + sat.map(renderRes).join('');
+  container.innerHTML = html;
+}
+
+// Staff version of markTableSat — reads from staff-prefixed element IDs
+function markTableSatStaff(resId) {
+  const res = RESERVATION_QUEUE.find(r => r.id === resId);
+  if (!res) return;
+
+  const tableNum = selectedFloorTable[resId];
+  if (!tableNum) { showToast('Select a table from the floor plan first'); return; }
+
+  const waitressId = document.getElementById(`staff-res-waitress-${resId}`)?.value;
+  if (!waitressId) { showToast('Assign a waitress before marking as sat'); return; }
+
+  const alreadySat = RESERVATION_QUEUE.find(r =>
+    r.id !== resId && r.status === 'sat' &&
+    r.tableAssigned && r.tableAssigned.toString() === tableNum.toString()
+  );
+  if (alreadySat) { showToast(`Table ${tableNum} is already sat — pick another table`); return; }
+
+  res.waitressAssigned = waitressId;
+  res.tableAssigned    = tableNum.toString();
+  res.status           = 'sat';
+
+  const waitress = STAFF_LIST.find(s => s.id === waitressId);
+  const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+  const promoterEntry = SALES_LOG.find(s => s.memberId === res.memberId && s.type === 'table');
+  logSaleAndFireThread({
+    id: res.id, type: 'table',
+    memberId: res.memberId, memberName: res.memberName, memberPhone: res.memberPhone,
+    promoterId:    promoterEntry?.promoterId || res.referredByPromoter || null,
+    promoterName:  promoterEntry?.promoterName || null,
+    eventName:     res.eventName || 'tonight',
+    dateKey:       res.dateKey,
+    tableAssigned: res.tableAssigned,
+    waitressName:  waitress?.name || null,
+    partySize:     res.partySize,
+    amount:        promoterEntry?.amount || 0,
+    isComp:        promoterEntry?.isComp || false,
+  });
+
+  const sThread = SMS_THREADS.find(t => t.memberId === res.memberId && t.type === 'RESERVATION');
+  if (sThread && waitress) {
+    sThread.type           = 'FLOOR';
+    sThread.tag            = 'FLOOR';
+    sThread.threadName     = `${res.memberName} — Table ${res.tableAssigned}`;
+    sThread.tableNum       = res.tableAssigned;
+    sThread.waitressId     = waitress.id;
+    sThread.waitressName   = waitress.name;
+    sThread.recipientRoles = ['owner', 'barback'];
+    sThread.messages.push({
+      from: 'internal',
+      text: `🪑 Table ${res.tableAssigned} sat. ${waitress.name} is assigned as server. Barbacks notified.`,
+      time
+    });
+  }
+
+  const memberObj = members.find(m => m.id === res.memberId) || { id: res.memberId, name: res.memberName };
+  scheduleFollowUp(memberObj, res.eventName);
+
+  delete selectedFloorTable[resId];
+
+  showToast(`Table ${res.tableAssigned} sat — ${waitress?.name || 'server'} in thread · Follow-up at 9 AM`);
+
+  // Re-render both owner and staff reservation views so status is in sync
+  renderOwnerReservations();
+  renderStaffReservations();
 }
 
 // ─── Tickets & Pricing (Owner) ────────────────────────────
