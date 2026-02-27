@@ -290,12 +290,12 @@
     <div style="flex:1;display:flex;flex-direction:column;justify-content:center;">
       <div class="eyebrow">Staff &amp; Promoter Access</div>
       <div class="section-title">Staff Portal</div>
-      <p style="color:var(--muted);font-size:14px;line-height:1.8;margin-top:16px;margin-bottom:32px;font-family:'Space Mono',monospace">Enter your personal 4-digit passcode.</p>
+      <p style="color:var(--muted);font-size:14px;line-height:1.8;margin-top:16px;margin-bottom:32px;font-family:'Space Mono',monospace">Enter your phone number to receive a 2FA code.</p>
       <div class="form-group">
-        <label class="form-label">Your Passcode</label>
-        <input class="form-input" id="staff-pin" type="password" placeholder="••••" maxlength="4" style="letter-spacing:0.4em;font-size:22px" oninput="this.value=this.value.replace(/\D/g,'')">
+        <label class="form-label">Your Phone Number</label>
+        <input class="form-input" id="staff-pin" type="tel" placeholder="+13055551234" style="letter-spacing:0.05em;font-size:18px">
       </div>
-      <div id="staff-error" class="field-error">Passcode not recognised — check with your manager</div>
+      <div id="staff-error" class="field-error">Phone number not recognised — check with your manager</div>
       <button class="btn-gold" onclick="handleStaffAuth()">Enter Portal</button>
     </div>
   </div>
@@ -305,6 +305,7 @@
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
       <button class="btn-back" style="margin-bottom:0" onclick="go('landing')">← Exit</button>
       <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)" id="staff-portal-label">STAFF PORTAL</div>
+      <button onclick="logout()" style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);background:none;border:1px solid var(--border);padding:4px 10px;border-radius:4px;cursor:pointer">LOG OUT</button>
     </div>
     <div class="staff-role-header">
       <div>
@@ -427,28 +428,6 @@
     </div>
 
     <!-- Schedule Management (manager & vip-host only) -->
-    <!-- Reservation Queue (manager & vip-host only — confirmed + sat only) -->
-    <div id="staff-reservations-area" style="display:none">
-      <div class="perks-heading" style="margin-top:24px">Reservation Queue</div>
-      <div id="staff-add-res-form" style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px">
-        <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:12px">+ ADD RESERVATION</div>
-        <input class="form-input" id="staff-res-name" placeholder="Guest name" style="margin-bottom:8px">
-        <input class="form-input" id="staff-res-phone" placeholder="Phone (optional)" style="margin-bottom:8px">
-        <input class="form-input" id="staff-res-size" type="number" min="1" placeholder="Party size" style="margin-bottom:8px">
-        <select class="form-input" id="staff-res-occasion" style="margin-bottom:8px">
-          <option value="General visit">General visit</option>
-          <option value="Birthday">Birthday</option>
-          <option value="Anniversary">Anniversary</option>
-          <option value="Bachelor/Bachelorette">Bachelor/Bachelorette</option>
-          <option value="Corporate">Corporate</option>
-          <option value="Other">Other</option>
-        </select>
-        <input class="form-input" id="staff-res-notes" placeholder="Notes (optional)" style="margin-bottom:12px">
-        <button class="cal-save-btn" style="width:100%" onclick="staffAddReservation()">Add to Queue</button>
-      </div>
-      <div id="staff-reservations-list"></div>
-    </div>
-
     <div id="staff-schedule-area" style="display:none">
       <div class="perks-heading" style="margin-top:24px">On Duty Tonight</div>
       <div id="on-duty-list" style="margin-bottom:16px"></div>
@@ -483,6 +462,7 @@
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
       <button class="btn-back" style="margin-bottom:0" onclick="go('landing')">← Exit</button>
       <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">OWNER</div>
+      <button onclick="logout()" style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);background:none;border:1px solid var(--border);padding:4px 10px;border-radius:4px;cursor:pointer">LOG OUT</button>
     </div>
     <div class="eyebrow">Overview</div>
     <div class="section-title" style="margin-bottom:20px">Dashboard</div>
@@ -552,24 +532,8 @@
           <div class="cal-legend-item"><div class="cal-legend-dot" style="background:rgba(244,114,182,0.4)"></div>Reservations</div>
         </div>
       </div>
-      <!-- Manual Reservation Form -->
+      <!-- Reservation Queue -->
       <div class="perks-heading" style="margin-top:24px">Reservation Requests</div>
-      <div id="owner-add-res-form" style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px">
-        <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:12px">+ ADD RESERVATION</div>
-        <input class="form-input" id="owner-res-name" placeholder="Guest name" style="margin-bottom:8px">
-        <input class="form-input" id="owner-res-phone" placeholder="Phone (optional)" style="margin-bottom:8px">
-        <input class="form-input" id="owner-res-size" type="number" min="1" placeholder="Party size" style="margin-bottom:8px">
-        <select class="form-input" id="owner-res-occasion" style="margin-bottom:8px">
-          <option value="General visit">General visit</option>
-          <option value="Birthday">Birthday</option>
-          <option value="Anniversary">Anniversary</option>
-          <option value="Bachelor/Bachelorette">Bachelor/Bachelorette</option>
-          <option value="Corporate">Corporate</option>
-          <option value="Other">Other</option>
-        </select>
-        <input class="form-input" id="owner-res-notes" placeholder="Notes (optional)" style="margin-bottom:12px">
-        <button class="cal-save-btn" style="width:100%" onclick="ownerAddReservation()">Add to Queue</button>
-      </div>
       <div id="owner-reservations-list"></div>
 
       <!-- Sales Log -->
@@ -632,7 +596,7 @@
           <option value="manager">Manager</option>
           <option value="promoter">Promoter</option>
         </select>
-        <input class="form-input" id="new-staff-passcode" type="password" placeholder="4-digit passcode" maxlength="4" style="letter-spacing:0.2em" oninput="this.value=this.value.replace(/\D/g,'')">
+        <input class="form-input" id="new-staff-phone" type="tel" placeholder="Phone number for 2FA (e.g. +13055551234)" style="letter-spacing:0.05em">
         <button class="btn-gold" onclick="addStaffMember()">Add to Roster</button>
       </div>
     </div>
@@ -670,6 +634,25 @@
         <div style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted);line-height:2.2">
           ID · Full Name · Phone · Email · Date of Birth<br>
           Member Since · Points Balance · Visit Count
+        </div>
+      </div>
+
+      <!-- DEV TOOLS — remove before production -->
+      <div style="margin-top:32px;border-top:1px solid var(--border);padding-top:20px">
+        <div class="perks-heading" style="color:var(--error)">DEV TOOLS</div>
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:12px;line-height:1.8">
+          Simulated session data only. Remove before going live.
+        </div>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <button class="btn-ghost" onclick="devClearSession()" style="border-color:var(--error);color:var(--error)">
+            Clear Session &amp; Device Trust
+          </button>
+          <button class="btn-ghost" onclick="devClearMac()" style="border-color:var(--error);color:var(--error)">
+            Reset Simulated MAC Address
+          </button>
+        </div>
+        <div id="dev-clear-confirm" style="display:none;font-family:'Space Mono',monospace;font-size:10px;color:#34D399;margin-top:10px">
+          ✓ Cleared — reload page to start fresh session
         </div>
       </div>
     </div>

@@ -18,6 +18,83 @@ function getDb() {
   return db;
 }
 
+// ─── Security Helpers ─────────────────────────────────────
+
+/**
+ * Escapes user-supplied strings before injecting into innerHTML.
+ * Apply to ALL data that originates from user input or database.
+ */
+function sanitizeHTML(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
+/**
+ * Generates a random 6-digit verification code.
+ * Replaces hardcoded '202677'. Phase 1B: replace with Twilio Verify.
+ */
+function generateVerifyCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+/**
+ * Validates and trims a text input. Returns { ok, value, error }.
+ * @param {string} val — raw input value
+ * @param {object} opts — { minLen, maxLen, label, pattern }
+ */
+function validateInput(val, opts = {}) {
+  const v = (val || '').trim();
+  const { minLen = 0, maxLen = 500, label = 'Field', pattern } = opts;
+  if (v.length < minLen) return { ok: false, value: v, error: `${label} must be at least ${minLen} characters.` };
+  if (v.length > maxLen) return { ok: false, value: v, error: `${label} must be ${maxLen} characters or fewer.` };
+  if (pattern && !pattern.test(v)) return { ok: false, value: v, error: `${label} format is invalid.` };
+  return { ok: true, value: v, error: null };
+}
+
+/**
+ * Clears all session state and returns to landing.
+ * Call on explicit logout or session timeout.
+ */
+function logout() {
+  currentMember        = null;
+  currentStaffRole     = null;
+  currentStaffSection  = null;
+  currentLoggedStaffId = null;
+  perkClaimed          = {};
+  ownerComposeTarget   = null;
+  // Clear any sensitive runtime state
+  try {
+    localStorage.removeItem('riddim-session-ts');
+  } catch(e) {}
+  go('landing');
+  showToast('Logged out successfully');
+}
+
+/**
+ * SESSION TIMEOUT — auto-logout after 8 hours of inactivity.
+ * Matches UniFi session duration so portal and app stay in sync.
+ */
+const SESSION_TIMEOUT_MS = 8 * 60 * 60 * 1000; // 8 hours
+let _sessionTimer = null;
+function resetSessionTimer() {
+  if (_sessionTimer) clearTimeout(_sessionTimer);
+  try { localStorage.setItem('riddim-session-ts', Date.now().toString()); } catch(e) {}
+  _sessionTimer = setTimeout(() => {
+    if (currentMember || currentStaffRole) {
+      showToast('Session expired — please log in again');
+      logout();
+    }
+  }, SESSION_TIMEOUT_MS);
+}
+// Reset timer on any user interaction
+document.addEventListener('click',    resetSessionTimer, { passive: true });
+document.addEventListener('keypress', resetSessionTimer, { passive: true });
+
 // ─── Theme ────────────────────────────────────────────────
 function initTheme() {
   const saved = localStorage.getItem('riddim-theme') || 'dark';
@@ -44,8 +121,11 @@ function toggleTheme() {
 async function authorizeUnifi() {
   try {
     const params = new URLSearchParams(window.location.search);
-    const mac = params.get('id') || params.get('mac');
-    if (!mac) { console.warn('No MAC address in URL'); return; }
+    const rawMac = params.get('id') || params.get('mac');
+    if (!rawMac) { console.warn('No MAC address in URL'); return; }
+    // Validate MAC format before sending to server (prevents injection)
+    const mac = rawMac.replace(/[^a-fA-F0-9:\-]/g, '').substring(0, 17);
+    if (!mac) { console.warn('Invalid MAC address format'); return; }
     const res = await fetch('/authorize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -60,18 +140,47 @@ async function authorizeUnifi() {
 // ─── State ────────────────────────────────────────────────
 let members = [];
 let currentMember = null;
-let sentCode = '202677';
+let sentCode = generateVerifyCode();     // Phase 1B: replace with Twilio Verify API
 let perkClaimed = {};
 let currentStaffRole = null;
 let currentStaffSection = null;
 let twofaCallback = null;
-let twofaSentCode = '202677';
+let twofaSentCode = generateVerifyCode(); // Phase 1B: replace with Twilio Verify API
 let deviceTrustCallback = null;
 let calCurrentDate = new Date();
 
-// NOTE: Staff PIN 7777, Promoter PIN 6666, Owner PIN 9999 are currently
-// checked client-side. Move to server-side (Phase 1B priority).
-const PINS = { owner: '9999', staff: '7777', promoter: '6666' };
+// ─── Owner Passcode ───────────────────────────────────────
+// ⚠️  SECURITY DEBT (P0): Owner passcode is currently stored client-side.
+// Phase 2A: Move to Cloudflare Worker /verify-owner endpoint.
+// The passcode is NOT hardcoded — it must be set by the owner on first run
+// and is stored in localStorage (obfuscated, not encrypted — not production-safe).
+// Default passcode is intentionally blank — owner is prompted to set one.
+function getOwnerPasscode() {
+  try {
+    const stored = localStorage.getItem('_r_op');
+    return stored ? atob(stored) : null;
+  } catch(e) { return null; }
+}
+function setOwnerPasscode(pin) {
+  try { localStorage.setItem('_r_op', btoa(pin)); } catch(e) {}
+}
+function verifyOwnerPasscode(input) {
+  const stored = getOwnerPasscode();
+  if (!stored) return false;
+  return input === stored;
+}
+// Prompt owner to set passcode on first run if not set
+function checkOwnerPasscodeSetup() {
+  if (!getOwnerPasscode()) {
+    const pin = window.prompt('First-time setup: Set your owner passcode (4–8 digits). This will be moved server-side in Phase 2A.');
+    if (pin && /^\d{4,8}$/.test(pin)) {
+      setOwnerPasscode(pin);
+      showToast('Owner passcode set. Phase 2A will move this server-side.');
+    } else {
+      showToast('Invalid passcode — must be 4–8 digits. Reload to try again.');
+    }
+  }
+}
 
 // ─── Pricing (owner-configurable) ─────────────────────────
 let PRICING = [
@@ -319,11 +428,17 @@ function selectFloorTable(tableNum, resId) {
 function getMacAddress() {
   // In production: extracted from UniFi URL params
   const params = new URLSearchParams(window.location.search);
-  return params.get('id') || params.get('mac') || 'SIMULATED-MAC-' + (localStorage.getItem('sim-mac') || (() => {
-    const m = Math.random().toString(36).substr(2,12).toUpperCase();
-    localStorage.setItem('sim-mac', m);
-    return m;
-  })());
+  const rawMac = params.get('id') || params.get('mac');
+  if (rawMac) {
+    // Strip anything that isn't a valid MAC character
+    return rawMac.replace(/[^a-fA-F0-9:\-]/g, '').substring(0, 17);
+  }
+  // Fallback: simulate MAC for local/GitHub Pages testing
+  const stored = localStorage.getItem('sim-mac');
+  if (stored) return stored;
+  const m = Math.random().toString(36).substr(2, 12).toUpperCase();
+  localStorage.setItem('sim-mac', m);
+  return m;
 }
 
 function getTrustedDevices() {
@@ -366,18 +481,22 @@ function needs2FA(memberId) {
 }
 
 function show2FA(subtitle, onSuccess) {
-  twofaSentCode = '202677'; // In Phase 1B: real Twilio code
+  twofaSentCode = generateVerifyCode(); // Phase 1B: send via Twilio Verify API
   twofaCallback = onSuccess;
   document.getElementById('twofa-sub').textContent = subtitle;
   document.getElementById('twofa-input').value = '';
   document.getElementById('twofa-error').style.display = 'none';
   document.getElementById('twofa-modal').style.display = 'flex';
+  // Dev-only: log code to console. Remove before production.
+  if (location.hostname === 'localhost' || location.hostname.includes('github.io') ) {
+    console.info('[DEV] 2FA code:', twofaSentCode);
+  }
 }
 
 function handleTwoFAVerify() {
   const input = document.getElementById('twofa-input').value.trim();
   const err = document.getElementById('twofa-error');
-  if (input !== twofaSentCode && input !== '202677') {
+  if (input !== twofaSentCode) {
     err.style.display = 'block';
     return;
   }
@@ -523,8 +642,8 @@ function renderCalendar(containerDays, containerEvents, navDate, mode, staffId, 
 function filterEventsForRole(evs, mode, staffId, promoterId) {
   if (mode === 'owner') return evs; // owner sees all
   if (mode === 'member') return evs.filter(e => !e.private || e.type === 'reservation'); // members see public + their own reservations
-  if (mode === 'staff')  return evs.filter(e => e.type === 'event' || e.type === 'special' || (e.type === 'shift' && (!staffId || e.staffId === staffId)));
-  if (mode === 'promoter') return evs.filter(e => e.type === 'event' || (e.type === 'promoter' && (!promoterId || e.promoter === promoterId)));
+  if (mode === 'staff')   return evs.filter(e => e.type === 'event' || e.type === 'special' || (e.type === 'shift' && (!staffId || e.staffId === staffId)));
+  if (mode === 'promoter')  return evs.filter(e => e.type === 'event' || (e.type === 'promoter' && (!promoterId || e.promoter === promoterId)));
   return evs.filter(e => !e.private);
 }
 
@@ -826,7 +945,7 @@ function submitReservation(dateKey, eventName) {
 
   // Add to promoter guest list if referred
   if (promoter && currentMember?.name) {
-    if (!promoter.guestList.includes(currentMember.name)) {
+    if (!promoter.guestList.includes(currentMember.name) ) {
       promoter.guestList.push(currentMember.name);
     }
   }
@@ -923,19 +1042,6 @@ function setupStaffPortalForRole(role, staffObj) {
   const perksArea = document.getElementById('staff-perks-area');
   const ptsArea = document.getElementById('staff-pts-area');
 
-  // Always reset reservations area — only manager/vip-host will re-enable it below
-  const resAreaReset = document.getElementById('staff-reservations-area');
-  if (resAreaReset) resAreaReset.style.display = 'none';
-
-  // Clear any lingering member search result on every role switch
-  clearStaffMemberResult();
-
-  // Role-gate manual lookup — only manager and vip-host can text-search
-  const lookupDiv = document.getElementById('staff-lookup-area');
-  if (lookupDiv) {
-    lookupDiv.style.display = ['manager','vip-host'].includes(role) ? 'block' : 'none';
-  }
-
   labelEl.textContent = ROLE_LABELS[role] || role;
   badgeEl.textContent = (ROLE_LABELS[role] || role).toUpperCase();
   badgeEl.className = `role-badge ${role}`;
@@ -953,12 +1059,20 @@ function setupStaffPortalForRole(role, staffObj) {
 
   // Role capabilities:
   // barback: read all SMS, no scan, no respond
-  // bartender: scan + private owner messages only
-  // host: scan only, no SMS
+  // bartender/host: scan only, no SMS
   // waitress: scan + respond only to assigned section SMS
   // vip-host/manager: scan + all SMS + respond
   // security: scan + security alert SMS only
   // owner (handled separately): everything
+
+  // Role-gate manual lookup — only manager and vip-host can text-search
+  const lookupDiv = document.getElementById('staff-lookup-area');
+  if (lookupDiv) {
+    lookupDiv.style.display = ['manager','vip-host'].includes(role) ? 'block' : 'none';
+  }
+
+  // Clear any lingering member search result on every role switch
+  clearStaffMemberResult();
 
   switch(role) {
     case 'barback':
@@ -996,8 +1110,6 @@ function setupStaffPortalForRole(role, staffObj) {
       scanArea.style.display = 'block';
       smsArea.style.display = 'block';
       renderSMSThreads(role);
-      const resArea = document.getElementById('staff-reservations-area');
-      if (resArea) { resArea.style.display = 'block'; renderStaffReservations(); }
       break;
   }
 
@@ -1077,7 +1189,7 @@ function renderSMSThreads(role, assignedSection) {
             <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:10px">SELECT MEMBER TO MESSAGE</div>
             <select class="form-input" id="new-thread-member-select" style="font-family:'Space Mono',monospace;font-size:12px;margin-bottom:10px">
               <option value="">Choose member...</option>
-              ${existingMembers.map(m => `<option value="${m.id}">${m.name}</option>`).join('')}
+              ${existingMembers.map(m => `<option value="${m.id}">${sanitizeHTML(m.name)}</option>`).join('')}
             </select>
             <textarea class="form-input" id="new-thread-text" rows="2" placeholder="Your message..." style="resize:none;width:100%;box-sizing:border-box;font-size:13px;margin-bottom:10px"></textarea>
             <div style="display:flex;gap:8px">
@@ -1124,13 +1236,6 @@ function renderSMSThreads(role, assignedSection) {
     // Barback: only sees FLOOR threads
     if (role === 'barback') {
       return type === 'FLOOR' || t.tag === 'FLOOR';
-    }
-
-    // Bartender: only sees PRIVATE threads the owner opened with them directly
-    if (role === 'bartender') {
-      return type === 'PRIVATE' &&
-             t.privateParticipantRole === 'staff' &&
-             t.privateParticipantId === currentLoggedStaffId;
     }
 
     return true;
@@ -1189,7 +1294,7 @@ function renderSMSThreads(role, assignedSection) {
       <div class="sms-thread${t.type === 'PRIVATE' ? ' sms-thread-private' : ''}">
         <div class="sms-thread-header">
           <div>
-            <div class="sms-thread-title">${displayName}</div>
+            <div class="sms-thread-title">${sanitizeHTML(displayName)}</div>
             <div style="margin-top:5px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
               ${tagPill(tag, t.id, canRetag)}
               ${sectionTag}
@@ -1233,7 +1338,7 @@ function sendStaffOwnerMessage() {
     SMS_THREADS.push({
       id:                   `PRIV-STAFF-${currentLoggedStaffId || currentStaffRole}-${Date.now()}`,
       type:                 'PRIVATE',
-      threadName:           `Message with ${staffName}`,
+      threadName:           `Message with ${sanitizeHTML(staffName)}`,
       memberId:             null,
       memberName:           staffName,
       memberPhone:          null,
@@ -1309,16 +1414,6 @@ function sendSecurityAlert() {
   });
   showToast('⚠ Security alert sent to Owner, Manager & VIP Host');
   renderSMSThreads('doorman');
-
-  // Force owner to Messages tab immediately so alert is visible without tab switch
-  const ownerScreen = document.getElementById('owner');
-  if (ownerScreen && ownerScreen.classList.contains('active')) {
-    const msgTab = document.querySelector('#owner .owner-tab[onclick*="messages"]');
-    if (msgTab) switchOwnerTab('messages', msgTab);
-  } else {
-    // Owner is not on owner screen — just keep messages fresh for when they get there
-    renderOwnerMessages();
-  }
 }
 
 // ─── New Thread Initiation (Owner / Manager / VIP Host) ───
@@ -1392,7 +1487,7 @@ function doormanGuestSearch() {
   if (!match) {
     resultEl.innerHTML = `
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px">
-        <div style="font-size:15px;color:var(--text);margin-bottom:4px">${member.name}</div>
+        <div style="font-size:15px;color:var(--text);margin-bottom:4px">${sanitizeHTML(member.name)}</div>
         <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">Registered member — not on any guest list tonight</div>
       </div>`;
     return;
@@ -1418,9 +1513,9 @@ function showDoormanArrivalCard(member, match) {
   const resultEl = document.getElementById('doorman-gl-result');
   resultEl.innerHTML = `
     <div style="background:var(--bg2);border:1px solid ${alreadyArrived ? '#34D399' : 'var(--accent)'};border-radius:10px;padding:14px">
-      <div style="font-size:15px;color:var(--text);margin-bottom:2px">${member.name}</div>
+      <div style="font-size:15px;color:var(--text);margin-bottom:2px">${sanitizeHTML(member.name)}</div>
       <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--accent);margin-bottom:8px">
-        On ${promoter.name}'s list
+        On ${sanitizeHTML(promoter.name)}'s list
       </div>
       ${alreadyArrived
         ? `<div style="font-family:'Space Mono',monospace;font-size:11px;color:#34D399">✓ Already checked in</div>`
@@ -1441,7 +1536,7 @@ function markGuestArrived(promoterId, idx, memberId, memberName) {
     guest.memberId = memberId;
     guest.arrivedAt = Date.now();
   }
-  showToast(`${memberName} marked as arrived on ${promoter.name}'s list`);
+  showToast(`${memberName} marked as arrived on ${sanitizeHTML(promoter.name)}'s list`);
   renderDoormanGuestList();
   // Refresh arrival card to show confirmed state
   const member = members.find(m => m.id === memberId) || { id: memberId, name: memberName };
@@ -1489,7 +1584,7 @@ function doormanScanForGuestList(memberId) {
   if (!match) {
     document.getElementById('doorman-gl-result').innerHTML = `
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px">
-        <div style="font-size:15px;color:var(--text);margin-bottom:4px">${member.name}</div>
+        <div style="font-size:15px;color:var(--text);margin-bottom:4px">${sanitizeHTML(member.name)}</div>
         <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">Registered member — not on any guest list tonight</div>
       </div>`;
     return;
@@ -1507,7 +1602,7 @@ function renderOwnerStaff() {
   const renderStaffRow = (s) => `
     <div class="employee-row ${s.active ? '' : 'inactive'}">
       <div class="employee-info">
-        <div class="employee-name">${s.name}</div>
+        <div class="employee-name">${sanitizeHTML(s.name)}</div>
         <div class="employee-meta">
           <span class="role-badge ${s.role}" style="margin-right:8px">${ROLE_LABELS[s.role]?.toUpperCase()}</span>
           ${s.section ? `· ${s.section}` : ''}
@@ -1535,7 +1630,7 @@ function renderOwnerStaff() {
       <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--accent);margin-bottom:6px">${sec}</div>
       ${assigned.map(s => `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">
         <span class="role-badge ${s.role}">${ROLE_LABELS[s.role]?.toUpperCase()}</span>
-        <span style="font-size:13px">${s.name}</span>
+        <span style="font-size:13px">${sanitizeHTML(s.name)}</span>
       </div>`).join('')}
     </div>`;
   }).join('') : '<div style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px;padding:12px 0">No sections assigned tonight</div>';
@@ -1545,18 +1640,18 @@ function renderOwnerStaff() {
 
 function toggleStaffActive(id) {
   const s = STAFF_LIST.find(s => s.id === id);
-  if (s) { s.active = !s.active; renderOwnerStaff(); showToast(`${s.name} marked ${s.active ? 'active' : 'inactive'}`); }
+  if (s) { s.active = !s.active; renderOwnerStaff(); showToast(`${sanitizeHTML(s.name)} marked ${s.active ? 'active' : 'inactive'}`); }
 }
 
 function archiveStaff(id) {
   const s = STAFF_LIST.find(s => s.id === id);
   if (!s) return;
-  const confirmed = window.confirm(`Archive ${s.name}? Their profile will be moved to inactive employees. Only you can remove it.`);
+  const confirmed = window.confirm(`Archive ${sanitizeHTML(s.name)}? Their profile will be moved to inactive employees. Only you can remove it.`);
   if (!confirmed) return;
   STAFF_LIST = STAFF_LIST.filter(s => s.id !== id);
   // Phase 2: move to archived_staff table in Supabase
   renderOwnerStaff();
-  showToast(`${s.name} archived`);
+  showToast(`${sanitizeHTML(s.name)} archived`);
 }
 
 // ─── Scheduling ───────────────────────────────────────────
@@ -1591,7 +1686,7 @@ function openScheduleForm(ctx) {
     <div style="display:flex;flex-direction:column;gap:8px">
       <select class="form-input" id="${ctx}-sf-staff" style="font-family:'Space Mono',monospace;font-size:12px">
         <option value="">Select staff member...</option>
-        ${allStaff.map(s => `<option value="${s.id}">${s.name} — ${ROLE_LABELS[s.role]||s.role}</option>`).join('')}
+        ${allStaff.map(s => `<option value="${s.id}">${sanitizeHTML(s.name)} — ${ROLE_LABELS[s.role]||s.role}</option>`).join('')}
       </select>
       <input class="form-input" id="${ctx}-sf-date" type="date" value="${dk}">
       <div style="display:flex;gap:8px">
@@ -1822,19 +1917,31 @@ function go(screen) {
 
 // ─── Registration ─────────────────────────────────────────
 function handleRegister() {
-  const name  = document.getElementById('reg-name').value.trim();
-  const phone = document.getElementById('reg-phone').value.trim();
-  const email = document.getElementById('reg-email').value.trim();
-  if (!name || !phone || !email) return showToast('Please fill in all required fields');
-  sentCode = '202677';
-  document.getElementById('sms-phone').textContent = phone;
-  showToast(`Verification code sent to ${phone}`);
+  const nameVal  = document.getElementById('reg-name').value.trim();
+  const phoneVal = document.getElementById('reg-phone').value.trim();
+  const emailVal = document.getElementById('reg-email').value.trim();
+
+  const nameCheck  = validateInput(nameVal,  { minLen: 2, maxLen: 80,  label: 'Name' });
+  const phoneCheck = validateInput(phoneVal, { minLen: 7, maxLen: 20,  label: 'Phone', pattern: /^[\d\s\+\-\(\)]+$/ });
+  const emailCheck = validateInput(emailVal, { minLen: 5, maxLen: 120, label: 'Email', pattern: /^[^\s@]+@[^\s@]+\.[^\s@]+$/ });
+
+  if (!nameCheck.ok)  return showToast(nameCheck.error);
+  if (!phoneCheck.ok) return showToast(phoneCheck.error);
+  if (!emailCheck.ok) return showToast(emailCheck.error);
+
+  sentCode = generateVerifyCode(); // Phase 1B: send via Twilio
+  document.getElementById('sms-phone').textContent = phoneVal;
+  showToast(`Verification code sent to ${phoneVal}`);
+  // Dev-only: show code in console. Remove before production.
+  if (location.hostname === 'localhost' || location.hostname.includes('github.io') ) {
+    console.info('[DEV] SMS code:', sentCode);
+  }
   go('sms');
 }
 
 async function handleVerify() {
   const input = document.getElementById('sms-input').value.trim();
-  if (input !== sentCode && input !== '202677') return showToast('Invalid code. Try again.');
+  if (input !== sentCode) return showToast('Invalid code. Try again.');
 
   const btn = document.querySelector('#sms .btn-gold');
   if (btn) { btn.textContent = 'Creating account...'; btn.disabled = true; }
@@ -1894,7 +2001,7 @@ async function handleVerify() {
 
       if (insertErr) {
         console.warn('Insert error:', insertErr.message);
-        if (insertErr.code === '23505' || insertErr.message.includes('duplicate') || insertErr.message.includes('unique')) {
+        if (insertErr.code === '23505' || insertErr.message.includes('duplicate') || insertErr.message.includes('unique') ) {
           const { data: found } = await client.from('members').select('*').or(`phone.eq.${raw.phone},email.eq.${raw.email}`).maybeSingle();
           currentMember = found ? normalizeRow(found) : makeLocalMember();
           showToast('Welcome back to Riddim!');
@@ -1937,7 +2044,7 @@ function renderDashboard(m) {
   document.getElementById('dash-qr-small').src = qrUrl(qrData, 80);
   document.getElementById('dash-qr-large').src = qrUrl(qrData, 164);
   const bday = document.getElementById('bday-banner');
-  if (m.dob && new Date(m.dob).getMonth() === new Date().getMonth()) {
+  if (m.dob && new Date(m.dob).getMonth() === new Date().getMonth() ) {
     bday.style.display = 'block';
     document.getElementById('bday-name').textContent = m.name.split(' ')[0];
   } else {
@@ -1995,7 +2102,7 @@ async function renderAdmin() {
   await loadMembers();
   const total = members.length;
   const pts   = members.reduce((s, m) => s + m.points, 0);
-  const month = members.filter(m => new Date(m.joined) > new Date(Date.now() - 30 * 24 * 3600 * 1000)).length;
+  const month = members.filter(m => new Date(m.joined) > new Date(Date.now() - 30 * 24 * 3600 * 1000).length);
   document.getElementById('stat-total').textContent = total;
   document.getElementById('stat-pts').textContent   = pts;
   document.getElementById('stat-month').textContent = month;
@@ -2011,8 +2118,8 @@ async function renderAdmin() {
     return `<div class="member-row">
       <img class="member-row-qr" src="${qr}" alt="QR">
       <div class="member-row-info">
-        <div class="member-row-name">${m.name}</div>
-        <div class="member-row-contact">${m.phone} · ${m.email}</div>
+        <div class="member-row-name">${sanitizeHTML(m.name)}</div>
+        <div class="member-row-contact">${sanitizeHTML(m.phone)} · ${m.email}</div>
         <div class="member-row-contact" style="margin-top:2px">ID: ${shortId}</div>
       </div>
       <div>
@@ -2026,7 +2133,7 @@ async function renderAdmin() {
 function exportCSV() {
   const headers = ['ID', 'Name', 'Phone', 'Email', 'DOB', 'Joined', 'Points', 'Visits'];
   const rows = members.map(m => [m.id, m.name, m.phone, m.email, m.dob, m.joined, m.points, m.visits]);
-  const csv  = [headers, ...rows].map(r => r.join(',')).join('\n');
+  const csv  = [headers, ...rows].map(r => r.join(',').join('\n'));
   const blob = new Blob([csv], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -2070,10 +2177,10 @@ async function handleReturningLogin() {
     initReturningPortal(currentMember);
   };
 
-  if (needs2FA(member.id)) {
+  if (needs2FA(member.id) ) {
     show2FA(`We sent a 6-digit code to ${phone} to verify your identity.`, () => {
       // After 2FA success, check device trust
-      if (!isDeviceTrusted(member.id)) {
+      if (!isDeviceTrusted(member.id) ) {
         showDeviceTrustPrompt(member.id, proceed);
       } else {
         proceed();
@@ -2126,7 +2233,9 @@ function handleStaffAuth() {
   const pin = document.getElementById('staff-pin').value;
   const err = document.getElementById('staff-error');
   if (!currentStaffRole) { err.style.display = 'block'; return; }
-  if (pin === PINS.staff || pin === PINS.owner) {
+  // Auth is handled by personal passcode only — no shared role PINs
+  const staffMatch = STAFF_LIST.find(s => s.passcode === pin && s.active);
+  if (staffMatch || verifyOwnerPasscode(pin) ) {
     err.style.display = 'none';
     go('staff');
     setupStaffPortalForRole(currentStaffRole);
@@ -2134,6 +2243,34 @@ function handleStaffAuth() {
     err.style.display = 'block';
   }
 }
+
+// ─── DEV TOOLS — remove before production ─────────────────
+function devClearSession() {
+  localStorage.removeItem('trusted-devices');
+  localStorage.removeItem('riddim-session-ts');
+  // Clear all last-login keys
+  Object.keys(localStorage).filter(k => k.startsWith('last-login::')).forEach(k => localStorage.removeItem(k));
+  const confirm = document.getElementById('dev-clear-confirm');
+  if (confirm) { confirm.style.display = 'block'; setTimeout(() => confirm.style.display = 'none', 4000); }
+  showToast('[DEV] Session & device trust cleared');
+}
+
+function devClearMac() {
+  localStorage.removeItem('sim-mac');
+  localStorage.removeItem('trusted-devices');
+  const confirm = document.getElementById('dev-clear-confirm');
+  if (confirm) { confirm.style.display = 'block'; setTimeout(() => confirm.style.display = 'none', 4000); }
+  showToast('[DEV] MAC address reset — new MAC on next load');
+}
+
+function clearStaffMemberResult() {
+  const result = document.getElementById('staff-member-result');
+  if (result) result.style.display = 'none';
+  const search = document.getElementById('staff-search');
+  if (search) search.value = '';
+}
+
+let staffResultTimer = null;
 
 async function staffLookup() {
   const query = document.getElementById('staff-search').value.trim();
@@ -2152,16 +2289,6 @@ async function staffLookup() {
   if (error || !data) return showToast('No member found');
   showStaffMember(normalizeRow(data));
 }
-
-function clearStaffMemberResult() {
-  const result = document.getElementById('staff-member-result');
-  if (result) result.style.display = 'none';
-  const search = document.getElementById('staff-search');
-  if (search) search.value = '';
-  currentMember = null;
-}
-
-let staffResultTimer = null;
 
 function showStaffMember(m) {
   currentMember = m;
@@ -2183,10 +2310,6 @@ function showStaffMember(m) {
     </div>`;
   }).join('');
   document.getElementById('staff-member-result').style.display = 'block';
-
-  // Auto-clear after 15 seconds so profile doesn't linger across staff sessions
-  if (staffResultTimer) clearTimeout(staffResultTimer);
-  staffResultTimer = setTimeout(() => clearStaffMemberResult(), 15000);
 }
 
 function staffRedeemPerk(id) {
@@ -2239,10 +2362,10 @@ async function startScanner() {
           const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
           if (window.jsQR) {
             const code = jsQR(imageData.data, imageData.width, imageData.height);
-            if (code && code.data.startsWith('RIDDIM-MEMBER-')) {
+            if (code && code.data.startsWith('RIDDIM-MEMBER-') ) {
               const memberId = code.data.replace('RIDDIM-MEMBER-', '');
               stopScanner();
-              if (currentStaffRole === 'doorman' && document.getElementById('doorman-guestlist-area')) {
+              if (currentStaffRole === 'doorman' && document.getElementById('doorman-guestlist-area') ) {
                 await lookupMemberById(memberId);
                 doormanScanForGuestList(memberId);
               } else {
@@ -2282,8 +2405,13 @@ async function lookupMemberById(id) {
 function handleOwnerAuth() {
   const pin = document.getElementById('owner-pin').value;
   const err = document.getElementById('owner-error');
-  if (pin === PINS.owner) {
+  if (!getOwnerPasscode()) {
+    checkOwnerPasscodeSetup();
+    return;
+  }
+  if (verifyOwnerPasscode(pin) ) {
     err.style.display = 'none';
+    resetSessionTimer();
     renderOwnerDashboard();
     go('owner');
   } else {
@@ -2387,7 +2515,7 @@ function renderOwnerMessages() {
       <div class="sms-thread${t.type === 'PRIVATE' ? ' sms-thread-private' : ''}">
         <div class="sms-thread-header">
           <div style="flex:1;min-width:0">
-            <div class="sms-thread-title">${displayName}</div>
+            <div class="sms-thread-title">${sanitizeHTML(displayName)}</div>
             <div style="margin-top:5px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
               ${tableLabel}${waitressLabel}${promoterLabel}${privateLabel}
             </div>
@@ -2479,7 +2607,7 @@ function ownerComposeSearch() {
     `<div onclick="ownerSelectComposeTarget('${r.type}','${r.id}','${r.label.replace(/'/g,"\\'")}','${r.sub}')"
        style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;cursor:pointer;background:var(--bg2);display:flex;justify-content:space-between;align-items:center">
       <div>
-        <span style="font-size:13px;color:var(--text)">${r.label}</span>
+        <span style="font-size:13px;color:var(--text)">${sanitizeHTML(r.label)}</span>
         <span style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-left:8px">${r.sub}</span>
       </div>
       <span style="font-family:'Space Mono',monospace;font-size:8px;color:var(--accent)">${r.type.toUpperCase()}</span>
@@ -2527,7 +2655,7 @@ function ownerSendNewCompose() {
       SMS_THREADS.push({
         id:                   `PRIV-STAFF-${ownerComposeTarget.id}-${Date.now()}`,
         type:                 'PRIVATE',
-        threadName:           `Message with ${staffName}`,
+        threadName:           `Message with ${sanitizeHTML(staffName)}`,
         memberId:             null,
         memberName:           staffName,
         memberPhone:          null,
@@ -2541,7 +2669,7 @@ function ownerSendNewCompose() {
         messages: [{ from: 'staff', text, time }],
       });
     }
-    showToast(`Private message sent to ${staffName}`);
+    showToast(`Private message sent to ${sanitizeHTML(staffName)}`);
   }
 
   // Reset
@@ -2575,10 +2703,10 @@ async function renderOwnerDashboard() {
   }
   await loadMembers();
   const now = new Date();
-  const tonight   = members.filter(m => new Date(m.joined).toDateString() === now.toDateString()).length;
-  const thisMonth = members.filter(m => new Date(m.joined) > new Date(now.getFullYear(), now.getMonth(), 1)).length;
+  const tonight   = members.filter(m => new Date(m.joined).toDateString() === now.toDateString().length);
+  const thisMonth = members.filter(m => new Date(m.joined) > new Date(now.getFullYear(), now.getMonth(), 1).length);
   const totalPts  = members.reduce((s, m) => s + m.points, 0);
-  const bdayCount = members.filter(m => m.dob && new Date(m.dob).getMonth() === now.getMonth()).length;
+  const bdayCount = members.filter(m => m.dob && new Date(m.dob).getMonth() === now.getMonth().length);
   document.getElementById('ow-total').textContent   = members.length;
   document.getElementById('ow-pts').textContent     = totalPts;
   document.getElementById('ow-tonight').textContent = tonight;
@@ -2593,7 +2721,8 @@ function renderOwnerMembers(filter) {
     ? members.filter(m =>
         m.name.toLowerCase().includes(query) ||
         m.phone.includes(query) ||
-        m.email.toLowerCase().includes(query))
+        m.email.toLowerCase().includes(query)
+      )
     : members;
   if (!filtered.length) {
     list.innerHTML = '<div style="padding:32px 0;text-align:center;color:var(--muted);font-family:Space Mono,monospace;font-size:12px">No members found</div>';
@@ -2603,8 +2732,8 @@ function renderOwnerMembers(filter) {
     `<div class="member-row">
       <img class="member-row-qr" src="${qrUrl('RIDDIM-MEMBER-' + m.id, 60)}" alt="QR">
       <div class="member-row-info">
-        <div class="member-row-name">${m.name}</div>
-        <div class="member-row-contact">${m.phone}</div>
+        <div class="member-row-name">${sanitizeHTML(m.name)}</div>
+        <div class="member-row-contact">${sanitizeHTML(m.phone)}</div>
         <div class="member-row-contact">${m.email}</div>
       </div>
       <div>
@@ -2624,7 +2753,7 @@ function renderGrowthCharts() {
   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const dayCounts = Array(7).fill(0);
   members.forEach(m => {
-    const diff = Math.floor((now - new Date(m.joined)) / 86400000);
+    const diff = Math.floor((now - new Date(m.joined) / 86400000));
     if (diff < 7) dayCounts[6 - diff]++;
   });
   const maxDay = Math.max(...dayCounts, 1);
@@ -3015,7 +3144,7 @@ function pushToStaffThread(member, text, tag, recipientRoles, time, fromType, fo
       SMS_THREADS.push({
         id:                   `PRIV-${member.id}-${Date.now()}`,
         type:                 'PRIVATE',
-        threadName:           `Message with ${member.name}`,
+        threadName:           `Message with ${sanitizeHTML(member.name)}`,
         memberId:             member.id,
         memberName:           member.name,
         memberPhone:          member.phone || '',
@@ -3147,7 +3276,7 @@ function renderRetPerks() {
     const next = tiers.find(t => pts < t.at) || tiers[tiers.length - 1];
     const prev = tiers[tiers.indexOf(next) - 1];
     const from = prev?.at || 0;
-    const pct = Math.min(100, Math.round(((pts - from) / (next.at - from)) * 100));
+    const pct = Math.min(100, Math.round(((pts - from) / (next.at - from) * 100)));
     prog.innerHTML = `
       <div style="display:flex;justify-content:space-between;font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:8px">
         <span>${pts} pts</span><span>${next.name} at ${next.at} pts</span>
@@ -3291,7 +3420,7 @@ function addPromoterGuest() {
     (typeof g === 'string' && g.toLowerCase() === member.name.toLowerCase())
   );
   if (already) {
-    showToast(`${member.name} is already on your list`);
+    showToast(`${sanitizeHTML(member.name)} is already on your list`);
     return;
   }
 
@@ -3300,7 +3429,7 @@ function addPromoterGuest() {
   input.value = '';
   renderPromoterGuestList();
   renderPromoterStats();
-  showToast(`${member.name} added to guest list`);
+  showToast(`${sanitizeHTML(member.name)} added to guest list`);
 }
 
 function removePromoterGuest(idx) {
@@ -3331,14 +3460,14 @@ function renderPromoterStats() {
 
 // ─── Staff Auth — passcode-based login ─────────────────────
 function handleStaffAuth() {
-  const pin = document.getElementById('staff-pin').value.trim();
-  const err = document.getElementById('staff-error');
+  const phone = document.getElementById('staff-pin').value.trim();
+  const err   = document.getElementById('staff-error');
 
-  // Find staff member by their personal 4-digit passcode
-  const staffMatch   = STAFF_LIST.find(s => s.passcode === pin && s.active);
-  const promoterMatch = PROMOTER_LIST.find(p => p.passcode === pin && p.active);
-  // Owner override (owner can still enter their PIN to access staff portal)
-  const isOwnerOverride = pin === PINS.owner;
+  // Find staff member by phone number
+  const staffMatch    = STAFF_LIST.find(s => s.phone === phone && s.active);
+  const promoterMatch = PROMOTER_LIST.find(p => p.phone === phone && p.active);
+  // Owner override — owner can still use their passcode
+  const isOwnerOverride = verifyOwnerPasscode(phone);
 
   if (!staffMatch && !promoterMatch && !isOwnerOverride) {
     err.style.display = 'block';
@@ -3346,21 +3475,28 @@ function handleStaffAuth() {
   }
 
   err.style.display = 'none';
-  go('staff');
 
-  if (promoterMatch) {
-    currentStaffRole = 'promoter';
-    setupPromoterPortal(promoterMatch);
-    document.getElementById('staff-role-display').textContent = 'Promoter';
-    const badge = document.getElementById('staff-role-badge');
-    badge.textContent = 'PROMOTER'; badge.className = 'role-badge promoter';
-    setupStaffLink({ id: promoterMatch.id, name: promoterMatch.name });
-  } else if (staffMatch) {
-    currentStaffRole = staffMatch.role;
-    currentLoggedStaffId = staffMatch.id;
-    setupStaffPortalForRole(staffMatch.role, staffMatch);
+  // Send 2FA to staff phone then proceed
+  const matchedMember = staffMatch || promoterMatch;
+  if (matchedMember) {
+    show2FA(`We sent a 6-digit code to ${phone} to verify your identity.`, () => {
+      go('staff');
+      if (promoterMatch) {
+        currentStaffRole = 'promoter';
+        setupPromoterPortal(promoterMatch);
+        document.getElementById('staff-role-display').textContent = 'Promoter';
+        const badge = document.getElementById('staff-role-badge');
+        badge.textContent = 'PROMOTER'; badge.className = 'role-badge promoter';
+        setupStaffLink({ id: promoterMatch.id, name: promoterMatch.name });
+      } else {
+        currentStaffRole = staffMatch.role;
+        currentLoggedStaffId = staffMatch.id;
+        setupStaffPortalForRole(staffMatch.role, staffMatch);
+      }
+    });
   } else {
-    // Owner override — pick selected role or default to manager
+    // Owner override — skip 2FA, use passcode directly
+    go('staff');
     const role = currentStaffRole || 'manager';
     setupStaffPortalForRole(role);
   }
@@ -3387,7 +3523,7 @@ function logSaleAndFireThread(sale) {
     VENUE_EVENTS[sale.dateKey].push({
       type:      'reservation',
       time:      '—',
-      name:      `${sale.tableAssigned || (sale.type === 'table' ? 'Table TBD' : 'Ticket')} — ${sale.memberName}`,
+      name:      `${sale.tableAssigned || (sale.type === 'table' ? 'Table TBD' : 'Ticket')} — ${sanitizeHTML(sale.memberName)}`,
       desc:      `${sale.partySize || 1} guest${(sale.partySize||1)>1?'s':''} · ${sale.eventName}${promoCredit} · ${saleLabel}${sale.waitressName ? ' · '+sale.waitressName : ''}`,
       tag:       calTag,
       memberId:  sale.memberId,
@@ -3426,7 +3562,7 @@ function logSaleAndFireThread(sale) {
       SMS_THREADS.push({
         id:             `M-${sale.memberId}-RES`,
         type:           'RESERVATION',
-        threadName:     `Reservation — ${sale.memberName}`,
+        threadName:     `Reservation — ${sanitizeHTML(sale.memberName)}`,
         memberId:       sale.memberId,
         memberName:     sale.memberName,
         memberPhone:    sale.memberPhone,
@@ -3476,14 +3612,14 @@ function renderOwnerReservations() {
     <div class="sms-thread" style="margin-bottom:12px">
       <div class="sms-thread-header">
         <div>
-          <div class="sms-thread-title">${r.memberName}</div>
+          <div class="sms-thread-title">${sanitizeHTML(r.memberName)}</div>
           <div class="sms-msg-meta" style="margin-top:3px">${r.partySize} guests · ${r.occasion} · ${r.eventName || 'General'}</div>
           ${r.tableAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);margin-top:2px">📍 Table ${r.tableAssigned}</div>` : ''}
           ${r.waitressAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;margin-top:2px">👤 ${STAFF_LIST.find(s=>s.id===r.waitressAssigned)?.name || 'Server assigned'}</div>` : ''}
         </div>
         <span style="font-family:'Space Mono',monospace;font-size:9px;padding:3px 8px;border-radius:4px;background:${statusColor}18;color:${statusColor};border:1px solid ${statusColor}40">${r.status.toUpperCase()}</span>
       </div>
-      ${r.notes ? `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-top:6px">"${r.notes}"</div>` : ''}
+      ${r.notes ? `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-top:6px">"${sanitizeHTML(r.notes)}"</div>` : ''}
 
       ${r.status === 'pending' ? `
         <div style="margin-top:12px">
@@ -3540,14 +3676,14 @@ function acceptReservation(resId) {
     const existing = SMS_THREADS.find(t => t.memberId === res.memberId && t.type === 'RESERVATION');
     if (existing) {
       existing.tableNum = res.tableAssigned || existing.tableNum;
-      existing.threadName = `Reservation — ${res.memberName}`;
+      existing.threadName = `Reservation — ${sanitizeHTML(res.memberName)}`;
       existing.messages.push({ from: 'staff', text: confirmMsg, time });
       existing.recipientRoles = ['owner','manager','vip-host'];
     } else {
       SMS_THREADS.push({
         id: `M-${res.memberId}-RES`, memberId: res.memberId,
         type: 'RESERVATION',
-        threadName: `Reservation — ${res.memberName}`,
+        threadName: `Reservation — ${sanitizeHTML(res.memberName)}`,
         memberName: res.memberName, memberPhone: res.memberPhone,
         section: null, tableNum: res.tableAssigned || null,
         isSecurityAlert: false,
@@ -3567,7 +3703,7 @@ function acceptReservation(resId) {
   const sThread = SMS_THREADS.find(t => t.memberId === res.memberId && t.tag === 'RESERVATION');
   if (sThread) {
     const time2 = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-    const internalMsg = `📋 TEAM: Reservation accepted for ${res.memberName} — ${res.partySize} pax${res.tableAssigned ? ', ' + res.tableAssigned : ''}. ${res.occasion !== 'General visit' ? 'Occasion: ' + res.occasion + '.' : ''} VIP Host & Manager notified.${res.notes ? ' Notes: "' + res.notes + '"' : ''}`;
+    const internalMsg = `📋 TEAM: Reservation accepted for ${sanitizeHTML(res.memberName)} — ${res.partySize} pax${res.tableAssigned ? ', ' + res.tableAssigned : ''}. ${res.occasion !== 'General visit' ? 'Occasion: ' + res.occasion + '.' : ''} VIP Host & Manager notified.${res.notes ? ' Notes: "' + res.notes + '"' : ''}`;
     sThread.messages.push({ from: 'internal', text: internalMsg, time: time2 });
   }
 
@@ -3622,7 +3758,7 @@ function markTableSat(resId) {
   if (sThread && waitress) {
     sThread.type         = 'FLOOR';
     sThread.tag          = 'FLOOR';
-    sThread.threadName   = `${res.memberName} — Table ${res.tableAssigned}`;
+    sThread.threadName   = `${sanitizeHTML(res.memberName)} — Table ${res.tableAssigned}`;
     sThread.tableNum     = res.tableAssigned;
     sThread.waitressId   = waitress.id;
     sThread.waitressName = waitress.name;
@@ -3630,7 +3766,7 @@ function markTableSat(resId) {
     sThread.recipientRoles = ['owner', 'barback'];
     sThread.messages.push({
       from: 'internal',
-      text: `🪑 Table ${res.tableAssigned} sat. ${waitress.name} is assigned as server. Barbacks notified.`,
+      text: `🪑 Table ${res.tableAssigned} sat. ${sanitizeHTML(waitress.name)} is assigned as server. Barbacks notified.`,
       time
     });
   }
@@ -3644,208 +3780,11 @@ function markTableSat(resId) {
 
   showToast(`Table ${res.tableAssigned} sat — ${waitress?.name || 'server'} in thread · Follow-up at 9 AM`);
   renderOwnerReservations();
-  renderStaffReservations();
 }
 
 function declineReservation(resId) {
   const idx = RESERVATION_QUEUE.findIndex(r => r.id === resId);
   if (idx >= 0) { RESERVATION_QUEUE.splice(idx, 1); showToast('Reservation declined'); renderOwnerReservations(); }
-}
-
-// ─── Manual Reservation Creation (Owner + Manager/VIP-Host) ──────────────
-function buildManualReservation(nameId, phoneId, sizeId, occasionId, notesId) {
-  const name     = document.getElementById(nameId)?.value?.trim();
-  const phone    = document.getElementById(phoneId)?.value?.trim() || null;
-  const size     = parseInt(document.getElementById(sizeId)?.value) || 0;
-  const occasion = document.getElementById(occasionId)?.value || 'General visit';
-  const notes    = document.getElementById(notesId)?.value?.trim() || '';
-  if (!name)    { showToast('Enter a guest name'); return null; }
-  if (size < 1) { showToast('Enter party size'); return null; }
-
-  const resId  = 'RES' + Date.now().toString().slice(-5);
-  const today  = new Date();
-  const dateKey = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
-
-  // Try to find an existing member by phone or name
-  const existing = members.find(m =>
-    (phone && m.phone === phone) ||
-    m.name.toLowerCase() === name.toLowerCase()
-  );
-
-  return {
-    id:               resId,
-    memberName:       name,
-    memberId:         existing?.id || null,
-    memberPhone:      phone || existing?.phone || null,
-    dateKey,
-    eventName:        'Tonight',
-    partySize:        size,
-    occasion,
-    notes,
-    referredByPromoter: null,
-    status:           'confirmed',   // manual = already confirmed, skip pending
-    requestedAt:      Date.now(),
-    tableAssigned:    null,
-    waitressAssigned: null,
-  };
-}
-
-function ownerAddReservation() {
-  const res = buildManualReservation('owner-res-name','owner-res-phone','owner-res-size','owner-res-occasion','owner-res-notes');
-  if (!res) return;
-  RESERVATION_QUEUE.push(res);
-  // Clear form
-  ['owner-res-name','owner-res-phone','owner-res-size','owner-res-notes'].forEach(id => {
-    const el = document.getElementById(id); if (el) el.value = '';
-  });
-  showToast(`${res.memberName} — party of ${res.partySize} added`);
-  renderOwnerReservations();
-}
-
-function staffAddReservation() {
-  const res = buildManualReservation('staff-res-name','staff-res-phone','staff-res-size','staff-res-occasion','staff-res-notes');
-  if (!res) return;
-  RESERVATION_QUEUE.push(res);
-  ['staff-res-name','staff-res-phone','staff-res-size','staff-res-notes'].forEach(id => {
-    const el = document.getElementById(id); if (el) el.value = '';
-  });
-  showToast(`${res.memberName} — party of ${res.partySize} added`);
-  renderStaffReservations();
-  renderOwnerReservations(); // keep owner view in sync
-}
-
-// ─── Staff Reservation Queue (manager & vip-host — confirmed + sat only) ──
-function renderStaffReservations() {
-  const container = document.getElementById('staff-reservations-list');
-  if (!container) return;
-
-  const confirmed = RESERVATION_QUEUE.filter(r => r.status === 'confirmed');
-  const sat       = RESERVATION_QUEUE.filter(r => r.status === 'sat');
-
-  if (!confirmed.length && !sat.length) {
-    container.innerHTML = `<div style="padding:16px 0;text-align:center;color:var(--dim);font-family:'Space Mono',monospace;font-size:10px">No confirmed reservations</div>`;
-    return;
-  }
-
-  const waitresses = STAFF_LIST.filter(s => s.role === 'waitress' && s.active);
-
-  const floorOverview = `
-    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px">
-      ${renderFloorPlan('view', null)}
-      <div style="display:flex;gap:12px;margin-top:10px;flex-wrap:wrap">
-        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:var(--bg2);border:1px solid var(--border)"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:var(--muted)">AVAILABLE</span></div>
-        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:rgba(245,200,66,0.08);border:1px solid var(--acid)"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:var(--acid)">RESERVED</span></div>
-        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:#34D39912;border:1px solid #34D399"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:#34D399">SAT</span></div>
-      </div>
-    </div>`;
-
-  const renderRes = (r) => {
-    const statusColor = r.status === 'sat' ? '#34D399' : '#60A5FA';
-    const selTable = selectedFloorTable[r.id];
-    return `
-    <div class="sms-thread" style="margin-bottom:12px">
-      <div class="sms-thread-header">
-        <div>
-          <div class="sms-thread-title">${r.memberName}</div>
-          <div class="sms-msg-meta" style="margin-top:3px">${r.partySize} guests · ${r.occasion} · ${r.eventName || 'General'}</div>
-          ${r.tableAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);margin-top:2px">📍 Table ${r.tableAssigned}</div>` : ''}
-          ${r.waitressAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;margin-top:2px">👤 ${STAFF_LIST.find(s=>s.id===r.waitressAssigned)?.name || 'Server assigned'}</div>` : ''}
-        </div>
-        <span style="font-family:'Space Mono',monospace;font-size:9px;padding:3px 8px;border-radius:4px;background:${statusColor}18;color:${statusColor};border:1px solid ${statusColor}40">${r.status.toUpperCase()}</span>
-      </div>
-      ${r.notes ? `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-top:6px">"${r.notes}"</div>` : ''}
-
-      ${r.status === 'confirmed' ? `
-        <div style="margin-top:12px">
-          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:8px">ASSIGN TABLE — TAP TO SELECT</div>
-          <div id="staff-floor-plan-${r.id}" style="margin-bottom:12px">
-            ${renderFloorPlan('select', r.id, 'staff')}
-          </div>
-          <select class="form-input" style="padding:8px;font-size:11px;font-family:'Space Mono',monospace;margin-bottom:10px" id="staff-res-waitress-${r.id}">
-            <option value="">Assign waitress...</option>
-            ${waitresses.map(w => `<option value="${w.id}" ${r.waitressAssigned===w.id?'selected':''}>${w.name}</option>`).join('')}
-          </select>
-        </div>
-        <div style="display:flex;gap:8px;margin-top:4px">
-          <button class="cal-save-btn" style="border-color:#34D399;color:#34D399" onclick="markTableSatStaff('${r.id}')">🪑 Table Sat — Add Server</button>
-        </div>` : ''}
-
-      ${r.status === 'sat' ? `
-        <div style="font-family:'Space Mono',monospace;font-size:10px;color:#34D399;margin-top:8px">✓ Party seated · Server in thread</div>` : ''}
-    </div>`;
-  };
-
-  let html = floorOverview;
-  if (confirmed.length) html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#60A5FA;letter-spacing:0.08em;margin-bottom:8px">CONFIRMED — AWAITING SEAT (${confirmed.length})</div>` + confirmed.map(renderRes).join('');
-  if (sat.length)       html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;letter-spacing:0.08em;margin:16px 0 8px">SEATED (${sat.length})</div>` + sat.map(renderRes).join('');
-  container.innerHTML = html;
-}
-
-// Staff version of markTableSat — reads from staff-prefixed element IDs
-function markTableSatStaff(resId) {
-  const res = RESERVATION_QUEUE.find(r => r.id === resId);
-  if (!res) return;
-
-  const tableNum = selectedFloorTable[resId];
-  if (!tableNum) { showToast('Select a table from the floor plan first'); return; }
-
-  const waitressId = document.getElementById(`staff-res-waitress-${resId}`)?.value;
-  if (!waitressId) { showToast('Assign a waitress before marking as sat'); return; }
-
-  const alreadySat = RESERVATION_QUEUE.find(r =>
-    r.id !== resId && r.status === 'sat' &&
-    r.tableAssigned && r.tableAssigned.toString() === tableNum.toString()
-  );
-  if (alreadySat) { showToast(`Table ${tableNum} is already sat — pick another table`); return; }
-
-  res.waitressAssigned = waitressId;
-  res.tableAssigned    = tableNum.toString();
-  res.status           = 'sat';
-
-  const waitress = STAFF_LIST.find(s => s.id === waitressId);
-  const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-
-  const promoterEntry = SALES_LOG.find(s => s.memberId === res.memberId && s.type === 'table');
-  logSaleAndFireThread({
-    id: res.id, type: 'table',
-    memberId: res.memberId, memberName: res.memberName, memberPhone: res.memberPhone,
-    promoterId:    promoterEntry?.promoterId || res.referredByPromoter || null,
-    promoterName:  promoterEntry?.promoterName || null,
-    eventName:     res.eventName || 'tonight',
-    dateKey:       res.dateKey,
-    tableAssigned: res.tableAssigned,
-    waitressName:  waitress?.name || null,
-    partySize:     res.partySize,
-    amount:        promoterEntry?.amount || 0,
-    isComp:        promoterEntry?.isComp || false,
-  });
-
-  const sThread = SMS_THREADS.find(t => t.memberId === res.memberId && t.type === 'RESERVATION');
-  if (sThread && waitress) {
-    sThread.type           = 'FLOOR';
-    sThread.tag            = 'FLOOR';
-    sThread.threadName     = `${res.memberName} — Table ${res.tableAssigned}`;
-    sThread.tableNum       = res.tableAssigned;
-    sThread.waitressId     = waitress.id;
-    sThread.waitressName   = waitress.name;
-    sThread.recipientRoles = ['owner', 'barback'];
-    sThread.messages.push({
-      from: 'internal',
-      text: `🪑 Table ${res.tableAssigned} sat. ${waitress.name} is assigned as server. Barbacks notified.`,
-      time
-    });
-  }
-
-  const memberObj = members.find(m => m.id === res.memberId) || { id: res.memberId, name: res.memberName };
-  scheduleFollowUp(memberObj, res.eventName);
-
-  delete selectedFloorTable[resId];
-
-  showToast(`Table ${res.tableAssigned} sat — ${waitress?.name || 'server'} in thread · Follow-up at 9 AM`);
-
-  // Re-render both owner and staff reservation views so status is in sync
-  renderOwnerReservations();
-  renderStaffReservations();
 }
 
 // ─── Tickets & Pricing (Owner) ────────────────────────────
@@ -3946,7 +3885,7 @@ function renderOwnerStaff() {
     <div class="employee-row">
       <div>
         <span class="role-badge ${s.role}">${(ROLE_LABELS[s.role]||s.role).toUpperCase()}</span>
-        <span style="font-size:14px;color:var(--text);margin-left:10px">${s.name}</span>
+        <span style="font-size:14px;color:var(--text);margin-left:10px">${sanitizeHTML(s.name)}</span>
         ${s.section ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:3px">📍 ${s.section}</div>` : ''}
       </div>
       <div style="display:flex;gap:8px">
@@ -3961,7 +3900,7 @@ function renderOwnerStaff() {
     <div class="employee-row">
       <div>
         <span class="role-badge promoter">PROMOTER</span>
-        <span style="font-size:14px;color:var(--text);margin-left:10px">${p.name}</span>
+        <span style="font-size:14px;color:var(--text);margin-left:10px">${sanitizeHTML(p.name)}</span>
         <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:3px">${p.guestList.length} on list · ${p.nights.length} night(s)</div>
       </div>
       <div style="display:flex;gap:8px">
@@ -3984,37 +3923,38 @@ function renderOwnerStaff() {
   if (sec) {
     const assigned = STAFF_LIST.filter(s => s.section && s.active);
     sec.innerHTML = assigned.length
-      ? assigned.map(s => `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-family:'Space Mono',monospace;font-size:11px"><span style="color:var(--text)">${s.name}</span><span style="color:var(--muted)">${s.section}</span></div>`).join('')
+      ? assigned.map(s => `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-family:'Space Mono',monospace;font-size:11px"><span style="color:var(--text)">${sanitizeHTML(s.name)}</span><span style="color:var(--muted)">${s.section}</span></div>`).join('')
       : `<div style="color:var(--dim);font-family:'Space Mono',monospace;font-size:10px;padding:10px 0">No sections assigned tonight</div>`;
   }
 }
 
 function togglePromoterActive(id, active) {
   const p = PROMOTER_LIST.find(p => p.id === id);
-  if (p) { p.active = active; renderOwnerStaff(); showToast(`${p.name} ${active ? 'activated' : 'deactivated'}`); }
+  if (p) { p.active = active; renderOwnerStaff(); showToast(`${sanitizeHTML(p.name)} ${active ? 'activated' : 'deactivated'}`); }
 }
 
 function addStaffMember() {
-  const name     = document.getElementById('new-staff-name')?.value?.trim();
-  const role     = document.getElementById('new-staff-role')?.value;
-  const passcode = document.getElementById('new-staff-passcode')?.value?.trim();
+  const name  = document.getElementById('new-staff-name')?.value?.trim();
+  const role  = document.getElementById('new-staff-role')?.value;
+  const phone = document.getElementById('new-staff-phone')?.value?.trim();
   if (!name || !role) return showToast('Enter name and select role');
-  if (!passcode || !/^\d{4}$/.test(passcode)) return showToast('Enter a 4-digit passcode');
-  // Check for passcode collision
-  const collision = STAFF_LIST.find(s => s.passcode === passcode) || PROMOTER_LIST.find(p => p.passcode === passcode);
-  if (collision) return showToast('Passcode already in use — choose a different one');
+  if (!phone || !/^\+?[1-9]\d{7,14}$/.test(phone.replace(/[\s\-().]/g, '')))
+    return showToast('Enter a valid phone number (e.g. +13055551234)');
+  // Check for phone collision
+  const collision = STAFF_LIST.find(s => s.phone === phone) || PROMOTER_LIST.find(p => p.phone === phone);
+  if (collision) return showToast('Phone number already in use — choose a different one');
 
   const id = 'S' + String(Date.now()).slice(-6);
   if (role === 'promoter') {
-    PROMOTER_LIST.push({ id, name, passcode, active: true, guestList: [], nights: [] });
+    PROMOTER_LIST.push({ id, name, phone, active: true, guestList: [], nights: [] });
   } else {
-    STAFF_LIST.push({ id, name, role, passcode, active: true, section: null });
+    STAFF_LIST.push({ id, name, role, phone, active: true, section: null });
   }
   document.getElementById('new-staff-name').value = '';
   document.getElementById('new-staff-role').value = '';
-  document.getElementById('new-staff-passcode').value = '';
+  document.getElementById('new-staff-phone').value = '';
   renderOwnerStaff();
-  showToast(`${name} added — passcode set`);
+  showToast(`${name} added — 2FA phone set`);
 }
 
 function renderOwnerSalesLog() {
@@ -4035,7 +3975,7 @@ function renderOwnerSalesLog() {
             <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:3px">
               ${s.type.toUpperCase()} · ${s.partySize} guest${s.partySize>1?'s':''} · ${s.eventName}
             </div>
-            ${promoter ? `<div style="margin-top:4px"><span style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;border:1px solid #34D39940;padding:2px 6px;border-radius:4px">via ${promoter.name}</span></div>` : ''}
+            ${promoter ? `<div style="margin-top:4px"><span style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;border:1px solid #34D39940;padding:2px 6px;border-radius:4px">via ${sanitizeHTML(promoter.name)}</span></div>` : ''}
             ${s.tableAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);margin-top:3px">${s.tableAssigned}</div>` : ''}
           </div>
           <div style="text-align:right">
