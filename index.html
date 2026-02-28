@@ -13,6 +13,7 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<div id="dev-2fa-banner" style="display:none;position:fixed;top:0;left:0;right:0;background:#F5C842;color:#000;font-family:'Space Mono',monospace;font-size:18px;font-weight:bold;padding:14px;text-align:center;z-index:99999;letter-spacing:0.05em"></div>
 
 <div class="glow-top"></div>
 <div class="glow-bot"></div>
@@ -480,39 +481,50 @@
     <!-- OVERVIEW -->
     <div class="owner-tab-content active" id="owner-tab-overview">
       <div class="metric-grid">
-        <div class="metric-card">
+        <div class="metric-card" data-card="total" onclick="toggleOverviewCard('total')" style="cursor:pointer;transition:border-color 0.2s">
           <div class="metric-val" id="ow-total">0</div>
           <div class="metric-label">TOTAL MEMBERS</div>
           <div class="metric-change" id="ow-new">+0 this month</div>
         </div>
-        <div class="metric-card">
+        <div class="metric-card" data-card="pts" onclick="toggleOverviewCard('pts')" style="cursor:pointer;transition:border-color 0.2s">
           <div class="metric-val" id="ow-pts">0</div>
           <div class="metric-label">POINTS ISSUED</div>
         </div>
-        <div class="metric-card">
+        <div class="metric-card" data-card="tonight" onclick="toggleOverviewCard('tonight')" style="cursor:pointer;transition:border-color 0.2s">
           <div class="metric-val" id="ow-tonight">0</div>
           <div class="metric-label">JOINED TONIGHT</div>
         </div>
-        <div class="metric-card">
+        <div class="metric-card" data-card="bday" onclick="toggleOverviewCard('bday')" style="cursor:pointer;transition:border-color 0.2s">
           <div class="metric-val" id="ow-bday">0</div>
           <div class="metric-label">BIRTHDAYS THIS MONTH</div>
         </div>
       </div>
+      <!-- Drilldown panel — shown when a card is clicked -->
+      <div id="overview-drilldown" style="display:none;margin-top:16px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px;max-height:400px;overflow-y:auto"></div>
     </div>
 
     <!-- MEMBERS -->
     <div class="owner-tab-content" id="owner-tab-members">
       <div style="display:flex;gap:10px;margin-bottom:16px">
-        <input class="form-input" id="owner-search" type="text" placeholder="Search name, phone, email" oninput="ownerSearch()">
+        <input class="form-input" id="owner-search" type="text" placeholder="Search name, phone, email" oninput="ownerSearch()" style="flex:1">
+        <button class="btn-gold" style="white-space:nowrap;padding:10px 16px;font-size:12px" onclick="showOwnerAddMemberModal()">+ Add Member</button>
       </div>
       <div id="owner-members-list"></div>
-      <button class="btn-gold" style="margin-top:16px" onclick="exportCSV()">Export All Members (CSV)</button>
+      <button class="btn-ghost" style="margin-top:16px;width:100%" onclick="exportCSV()">Export All Members (CSV)</button>
     </div>
 
     <!-- CALENDAR -->
     <div class="owner-tab-content" id="owner-tab-calendar">
-      <div class="perks-heading">Event Calendar</div>
-      <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:16px;line-height:1.8">Full view: events, shifts, reservations, promoter nights. Click any date to add, edit, or assign tables.</div>
+      <!-- Subcategory views (top) -->
+      <div id="owner-cal-subs" style="margin-bottom:20px"></div>
+
+      <!-- Reservation Queue — owner approves here -->
+      <div class="perks-heading" style="margin-top:4px">Reservation Requests</div>
+      <div id="owner-reservations-list" style="margin-bottom:20px"></div>
+
+      <!-- Month view (bottom) -->
+      <div class="perks-heading" style="margin-top:4px">Month View</div>
+      <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:12px;line-height:1.8">Full calendar — events, shifts, reservations. Click any date to view or add.</div>
       <div class="cal-section">
         <div class="cal-header">
           <button class="cal-nav-btn" onclick="ownerCalNav(-1)">‹</button>
@@ -532,9 +544,6 @@
           <div class="cal-legend-item"><div class="cal-legend-dot" style="background:rgba(244,114,182,0.4)"></div>Reservations</div>
         </div>
       </div>
-      <!-- Reservation Queue -->
-      <div class="perks-heading" style="margin-top:24px">Reservation Requests</div>
-      <div id="owner-reservations-list"></div>
 
       <!-- Sales Log -->
       <div class="perks-heading" style="margin-top:24px">Ticket &amp; Table Sales</div>
@@ -544,14 +553,31 @@
 
     <!-- SCHEDULE -->
     <div class="owner-tab-content" id="owner-tab-schedule">
+      <!-- On Duty Tonight -->
       <div class="perks-heading">On Duty Tonight</div>
       <div id="owner-on-duty-list" style="margin-bottom:20px"></div>
 
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <div class="perks-heading" style="margin:0">This Week</div>
+      <!-- Monthly Schedule Calendar -->
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div class="perks-heading" style="margin:0">Schedule</div>
         <button id="owner-add-shift-btn" class="cal-save-btn" onclick="openScheduleForm('owner')">+ Add Shift</button>
       </div>
-      <div id="owner-weekly-schedule"></div>
+
+      <div class="cal-section" style="margin-bottom:16px">
+        <div class="cal-header">
+          <button class="cal-nav-btn" onclick="ownerSchedCalNav(-1)">‹</button>
+          <div class="cal-month-label" id="owner-sched-cal-label">Loading...</div>
+          <button class="cal-nav-btn" onclick="ownerSchedCalNav(1)">›</button>
+        </div>
+        <div class="cal-weekdays">
+          <div class="cal-weekday">S</div><div class="cal-weekday">M</div><div class="cal-weekday">T</div>
+          <div class="cal-weekday">W</div><div class="cal-weekday">T</div><div class="cal-weekday">F</div><div class="cal-weekday">S</div>
+        </div>
+        <div class="cal-days-grid" id="owner-sched-cal-grid"></div>
+      </div>
+
+      <!-- Selected day / week view -->
+      <div id="owner-sched-selected-view" style="margin-bottom:20px"></div>
       <div id="owner-schedule-panel"></div>
     </div>
 
@@ -563,42 +589,9 @@
       <div id="owner-sms-threads"></div>
     </div>
 
-    <!-- STAFF — separated by role type -->
+    <!-- STAFF — collapsible sections, rendered by renderOwnerStaff() -->
     <div class="owner-tab-content" id="owner-tab-staff">
-      <!-- Floor Staff -->
-      <div class="perks-heading">Floor Staff — Active</div>
-      <div id="owner-staff-floor-active"></div>
-      <div class="perks-heading" style="margin-top:20px">Floor Staff — Inactive / Day Off</div>
-      <div id="owner-staff-floor-inactive"></div>
-
-      <!-- Promoters -->
-      <div class="perks-heading" style="margin-top:24px">Promoters — Active</div>
-      <div id="owner-staff-promoters-active"></div>
-      <div class="perks-heading" style="margin-top:16px">Promoters — Inactive</div>
-      <div id="owner-staff-promoters-inactive"></div>
-
-      <!-- Section Assignments -->
-      <div class="perks-heading" style="margin-top:24px">Section Assignments Tonight</div>
-      <div id="owner-section-assignments"></div>
-
-      <!-- Add Staff -->
-      <div class="perks-heading" style="margin-top:24px">Add Staff / Promoter</div>
-      <div style="display:flex;flex-direction:column;gap:10px;margin-top:8px">
-        <input class="form-input" id="new-staff-name" placeholder="Full name">
-        <select class="form-input" id="new-staff-role" style="font-family:'Space Mono',monospace;font-size:12px">
-          <option value="">Select role...</option>
-          <option value="bartender">Bartender</option>
-          <option value="waitress">Waitress</option>
-          <option value="host">Host</option>
-          <option value="vip-host">VIP Host</option>
-          <option value="doorman">Doorman</option>
-          <option value="barback">Barback</option>
-          <option value="manager">Manager</option>
-          <option value="promoter">Promoter</option>
-        </select>
-        <input class="form-input" id="new-staff-phone" type="tel" placeholder="Phone number for 2FA (e.g. +13055551234)" style="letter-spacing:0.05em">
-        <button class="btn-gold" onclick="addStaffMember()">Add to Roster</button>
-      </div>
+      <!-- Populated entirely by renderOwnerStaff() -->
     </div>
 
     <!-- TICKETS & COMPS (owner only) -->
@@ -615,7 +608,11 @@
           <option value="vip-ticket">VIP Ticket</option>
           <option value="table">Table Reservation</option>
         </select>
-        <input class="form-input" id="comp-recipient" placeholder="Member name or phone">
+        <div style="position:relative">
+          <input class="form-input" id="comp-recipient" placeholder="Search member name or phone..." autocomplete="off" oninput="onCompRecipientInput(this.value)">
+          <div id="comp-member-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg2);border:1px solid var(--accent);border-radius:0 0 10px 10px;z-index:200;max-height:180px;overflow-y:auto"></div>
+        </div>
+        <div id="comp-member-confirm" style="display:none;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)"></div>
         <input class="form-input" id="comp-note" placeholder="Note (optional)">
         <button class="btn-gold" onclick="issueComp()">Issue Comp</button>
       </div>
