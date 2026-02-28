@@ -4,6 +4,15 @@
    UI34: Supabase wiring — reservations, staff, shifts, sms_threads, event_types, audit_log
 ───────────────────────────────────────────────────────── */
 
+/**
+ * Normalize a phone number to digits-only for comparison.
+ * Strips +, spaces, dashes, parens, and dots.
+ * e.g. "+13055551234" → "13055551234", "305-555-1234" → "3055551234"
+ */
+function normalizePhone(phone) {
+  return (phone || '').replace(/[\s\-().+]/g, '');
+}
+
 // ─── Supabase Init ────────────────────────────────────────
 const SUPABASE_URL  = 'https://tczcrgmaqcblerxmhlbd.supabase.co';
 const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRjemNyZ21hcWNibGVyeG1obGJkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE1MTc5MzksImV4cCI6MjA4NzA5MzkzOX0.UwHJgONvxOPR5pXN6wflOPU106jE8eCcHohBOJhL1Us';
@@ -288,13 +297,12 @@ async function loadSmsThreads() {
     }));
   } catch(e) { console.error('loadSmsThreads exception:', e); }
 }
-
 /** Write a new thread to Supabase, then write its initial messages */
 async function saveSmsThreadToDb(thread) {
   try {
     const client = getDb();
     if (!client) return;
-    const { error } = await client.from('sms_threads').insert([{
+    const { error } = await client.from('sms_threads').upsert([{
       id:                      thread.id,
       type:                    thread.type,
       thread_name:             thread.threadName   || null,
@@ -312,7 +320,7 @@ async function saveSmsThreadToDb(thread) {
       reservation_id:          thread.reservationId || null,
       waitress_id:             thread.waitressId   || null,
       waitress_name:           thread.waitressName || null,
-    }]);
+    }], { onConflict: 'id' });
     if (error) { console.error('saveSmsThreadToDb error:', error.message); return; }
     // Write initial messages
     if (thread.messages && thread.messages.length > 0) {
@@ -359,7 +367,6 @@ async function updateSmsThreadInDb(id, fields) {
     if (error) console.error('updateSmsThreadInDb error:', error.message);
   } catch(e) { console.error('updateSmsThreadInDb exception:', e); }
 }
-
 /** Write an audit log entry */
 async function writeAuditLog(action, targetTable, targetId, newValue = null, oldValue = null) {
   try {
@@ -4461,9 +4468,11 @@ function handleStaffAuth() {
   const phone = document.getElementById('staff-pin').value.trim();
   const err   = document.getElementById('staff-error');
 
-  // Find staff member by phone number
-  const staffMatch    = STAFF_LIST.find(s => s.phone === phone && s.active);
-  const promoterMatch = PROMOTER_LIST.find(p => p.phone === phone && p.active);
+  // Find staff member by phone number — normalize both sides to digits-only
+  // so "+13055551234" stored in DB matches "3055551234" typed at login (and vice versa)
+  const normPhone     = normalizePhone(phone);
+  const staffMatch    = STAFF_LIST.find(s => normalizePhone(s.phone) === normPhone && s.active);
+  const promoterMatch = PROMOTER_LIST.find(p => normalizePhone(p.phone) === normPhone && p.active);
   // Owner override — owner can still use their passcode
   const isOwnerOverride = verifyOwnerPasscode(phone);
 
@@ -5555,8 +5564,9 @@ function addStaffMember() {
   if (!name || !role) return showToast('Enter name and select role');
   if (!phone || !/^\+?[1-9]\d{7,14}$/.test(phone.replace(/[\s\-().]/g, '')))
     return showToast('Enter a valid phone number (e.g. +13055551234)');
-  // Check for phone collision
-  const collision = STAFF_LIST.find(s => s.phone === phone) || PROMOTER_LIST.find(p => p.phone === phone);
+  // Check for phone collision — normalize both sides so "+1305..." and "305..." are treated as the same number
+  const normNewPhone = normalizePhone(phone);
+  const collision = STAFF_LIST.find(s => normalizePhone(s.phone) === normNewPhone) || PROMOTER_LIST.find(p => normalizePhone(p.phone) === normNewPhone);
   if (collision) return showToast('Phone number already in use — choose a different one');
 
   const id = 'S' + String(Date.now()).slice(-6);
