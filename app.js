@@ -2660,6 +2660,13 @@ function go(screen) {
     // Ensure calendar is always rendered when these screens activate
     setTimeout(initDashCalendar, 50);
   }
+  if (screen === 'staffAuth') {
+    // Always refresh STAFF_LIST from Supabase when the staff login screen opens.
+    // Without this, STAFF_LIST stays empty on fresh page loads (it's only populated
+    // by renderOwnerDashboard), causing all staff phone lookups to fail with
+    // "Phone number not recognised" until the owner dashboard has been visited.
+    loadStaff();
+  }
 }
 
 // ─── Registration ─────────────────────────────────────────
