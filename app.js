@@ -149,6 +149,51 @@ let twofaSentCode = generateVerifyCode(); // Phase 1B: replace with Twilio Verif
 let deviceTrustCallback = null;
 let calCurrentDate = new Date();
 
+// ─── Account Lockout System ───────────────────────────────
+const MAX_FAILED_ATTEMPTS = 5;
+
+function getFailedAttempts(identifier) {
+  try { return JSON.parse(localStorage.getItem(`lockout::${identifier}`) || '{"count":0,"lockedAt":null}'); }
+  catch(e) { return { count: 0, lockedAt: null }; }
+}
+
+function recordFailedAttempt(identifier) {
+  const data = getFailedAttempts(identifier);
+  data.count += 1;
+  if (data.count >= MAX_FAILED_ATTEMPTS) {
+    data.lockedAt = Date.now();
+  }
+  localStorage.setItem(`lockout::${identifier}`, JSON.stringify(data));
+  return data;
+}
+
+function clearFailedAttempts(identifier) {
+  localStorage.removeItem(`lockout::${identifier}`);
+}
+
+function isAccountLocked(identifier) {
+  const data = getFailedAttempts(identifier);
+  return data.count >= MAX_FAILED_ATTEMPTS;
+}
+
+// Owner-only: unlock any member or staff account
+// Called from owner dashboard member detail view
+function ownerUnlockAccount(identifier, displayName) {
+  const pin = window.prompt(`OWNER OVERRIDE — Enter your owner passcode to unlock ${displayName}:`);
+  if (!pin) return;
+  if (!verifyOwnerPasscode(pin)) {
+    showToast('Invalid owner passcode — account not unlocked');
+    return;
+  }
+  clearFailedAttempts(identifier);
+  // Also clear device trust locks and reset 2FA state
+  const devices = getTrustedDevices();
+  Object.keys(devices).forEach(k => { if (k.startsWith(identifier + '::')) delete devices[k]; });
+  localStorage.setItem('trusted-devices', JSON.stringify(devices));
+  showToast(`✓ ${displayName}'s account unlocked — they can log in again`);
+  renderOwnerMembers();
+}
+
 // ─── Owner Passcode ───────────────────────────────────────
 // ⚠️  SECURITY DEBT (P0): Owner passcode is currently stored client-side.
 // Phase 2A: Move to Cloudflare Worker /verify-owner endpoint.
@@ -210,6 +255,29 @@ function getMemberThread(memberId) {
 
 // ─── Reservations queue ────────────────────────────────────
 let RESERVATION_QUEUE = [];
+
+// ─── Custom event types (owner-created, persisted to localStorage) ──
+// Phase 2: stored in Supabase event_types table
+const BUILT_IN_EVENT_TYPES = [
+  { value: 'event',   label: 'DJ / Host Night',        memberVisible: true  },
+  { value: 'special', label: 'Daily Special / Promo',  memberVisible: true  },
+];
+function getCustomEventTypes() {
+  try { return JSON.parse(localStorage.getItem('riddim-custom-event-types') || '[]'); } catch(e) { return []; }
+}
+function saveCustomEventTypes(arr) {
+  localStorage.setItem('riddim-custom-event-types', JSON.stringify(arr));
+}
+function getAllEventTypes() {
+  return [...BUILT_IN_EVENT_TYPES, ...getCustomEventTypes()];
+}
+function addCustomEventType(label) {
+  const value = 'custom_' + label.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_' + Date.now().toString().slice(-4);
+  const arr = getCustomEventTypes();
+  arr.push({ value, label, memberVisible: true });
+  saveCustomEventTypes(arr);
+  return value;
+}
 
 // ─── Mock events data (Phase 2: pull from Supabase events table) ──
 
@@ -419,9 +487,11 @@ function selectFloorTable(tableNum, resId) {
   const info = getFloorTableStatus(tableNum);
   if (info.status === 'sat') return showToast('Table ' + tableNum + ' is already sat');
   selectedFloorTable[resId] = tableNum;
-  // Re-render just the floor plan section for this reservation
-  const fp = document.getElementById(`floor-plan-${resId}`);
-  if (fp) fp.innerHTML = renderFloorPlan('select', resId);
+  // Re-render both owner and staff floor plan divs (whichever is present)
+  const fp      = document.getElementById(`floor-plan-${resId}`);
+  const fpStaff = document.getElementById(`staff-floor-plan-${resId}`);
+  if (fp)      fp.innerHTML      = renderFloorPlan('select', resId);
+  if (fpStaff) fpStaff.innerHTML = renderFloorPlan('select', resId);
 }
 
 // ─── 2FA / Device Trust ───────────────────────────────────
@@ -480,27 +550,59 @@ function needs2FA(memberId) {
   return daysSince >= 14;
 }
 
-function show2FA(subtitle, onSuccess) {
+function show2FA(subtitle, onSuccess, lockId) {
   twofaSentCode = generateVerifyCode(); // Phase 1B: send via Twilio Verify API
   twofaCallback = onSuccess;
   document.getElementById('twofa-sub').textContent = subtitle;
   document.getElementById('twofa-input').value = '';
   document.getElementById('twofa-error').style.display = 'none';
+  document.getElementById('twofa-error').textContent = 'Incorrect code — try again';
+  // Attach lockId for failed-attempt tracking
+  if (lockId) {
+    document.getElementById('twofa-modal').dataset.lockId = lockId;
+  } else {
+    delete document.getElementById('twofa-modal').dataset.lockId;
+  }
   document.getElementById('twofa-modal').style.display = 'flex';
   // Dev-only: log code to console. Remove before production.
   if (location.hostname === 'localhost' || location.hostname.includes('github.io') ) {
     console.info('[DEV] 2FA code:', twofaSentCode);
   }
+  // DEV banner — shows code on screen for any device (iPhone, Mac, etc). Remove before production.
+  const _devB = document.getElementById('dev-2fa-banner');
+  if (_devB) { _devB.textContent = `DEV CODE: ${twofaSentCode}`; _devB.style.display = 'block'; setTimeout(() => { _devB.style.display = 'none'; }, 30000); }
 }
 
 function handleTwoFAVerify() {
   const input = document.getElementById('twofa-input').value.trim();
   const err = document.getElementById('twofa-error');
+
+  // Check if identifier is locked (member phone stored on modal for tracking)
+  const lockedId = document.getElementById('twofa-modal').dataset.lockId;
+
   if (input !== twofaSentCode) {
+    if (lockedId) {
+      const data = recordFailedAttempt(lockedId);
+      const remaining = MAX_FAILED_ATTEMPTS - data.count;
+      if (data.count >= MAX_FAILED_ATTEMPTS) {
+        err.textContent = 'Account locked — too many failed attempts. Contact the venue.';
+        err.style.display = 'block';
+        document.getElementById('twofa-modal').style.display = 'none';
+        twofaCallback = null;
+        return;
+      }
+      err.textContent = `Incorrect code — ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining`;
+    } else {
+      err.textContent = 'Incorrect code — try again';
+    }
     err.style.display = 'block';
     return;
   }
+
+  // Success — clear failed attempts
+  if (lockedId) clearFailedAttempts(lockedId);
   err.style.display = 'none';
+  err.textContent = 'Incorrect code — try again';
   document.getElementById('twofa-modal').style.display = 'none';
   if (twofaCallback) twofaCallback();
 }
@@ -640,10 +742,15 @@ function renderCalendar(containerDays, containerEvents, navDate, mode, staffId, 
 }
 
 function filterEventsForRole(evs, mode, staffId, promoterId) {
+  const memberVisibleTypes = getAllEventTypes().filter(t => t.memberVisible).map(t => t.value);
   if (mode === 'owner') return evs; // owner sees all
-  if (mode === 'member') return evs.filter(e => !e.private || e.type === 'reservation'); // members see public + their own reservations
-  if (mode === 'staff')   return evs.filter(e => e.type === 'event' || e.type === 'special' || (e.type === 'shift' && (!staffId || e.staffId === staffId)));
-  if (mode === 'promoter')  return evs.filter(e => e.type === 'event' || (e.type === 'promoter' && (!promoterId || e.promoter === promoterId)));
+  if (mode === 'member') return evs.filter(e => (memberVisibleTypes.includes(e.type) || e.type === 'reservation') && !e.private);
+  if (mode === 'staff')   return evs.filter(e =>
+    memberVisibleTypes.includes(e.type) ||
+    (e.type === 'shift' && (!staffId || e.staffId === staffId)) ||
+    (e.type === 'reservation' && e.private)  // confirmed reservations visible to manager/vip-host staff
+  );
+  if (mode === 'promoter')  return evs.filter(e => memberVisibleTypes.includes(e.type) || (e.type === 'promoter' && (!promoterId || e.promoter === promoterId)));
   return evs.filter(e => !e.private);
 }
 
@@ -675,7 +782,7 @@ function showCalEvents(container, dateKey, day, y, m, mode, staffId, promoterId)
     <button class="cal-add-btn" onclick="showAddEventModal('${dateKey}')">+ Add Event</button>` : '';
 
   // Reserve button (members only)  
-  const reserveBtn = (mode === 'member' && evs.some(e => e.type === 'event')) ? `
+  const reserveBtn = (mode === 'member') ? `
     <button class="cal-reserve-btn" onclick="showReserveModal('${dateKey}')">Request Reservation</button>` : '';
 
   if (!evs.length) {
@@ -694,9 +801,14 @@ function showCalEvents(container, dateKey, day, y, m, mode, staffId, promoterId)
         ${isSaved ? '✓ Saved' : 'Save Date'}
       </button>`;
     }
-    if (mode === 'owner') {
+    if ((mode === 'owner' || mode === 'staff') && e.type === 'reservation' && e.private) {
+      // Confirmed reservation entry — show status badge only, no edit button, name + details only
+      const statusLabel = e.status === 'sat' ? 'SEATED' : 'CONFIRMED — AWAITING SEAT';
+      const statusColor = e.status === 'sat' ? '#34D399' : '#60A5FA';
+      actions = `<div style="margin-top:6px;display:inline-block;font-family:'Space Mono',monospace;font-size:9px;padding:3px 8px;border-radius:4px;background:${statusColor}18;color:${statusColor};border:1px solid ${statusColor}40">${statusLabel}</div>`;
+    } else if (mode === 'owner') {
       if (e.type === 'reservation') {
-        // Show full purchase context including promoter attribution
+        // Legacy ticket/sale reservation entries
         const sale = SALES_LOG.find(s => s.id === e.saleId || s.memberId === e.memberId);
         const promoTag = e.promoterId
           ? `<span style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;border:1px solid #34D39940;padding:2px 6px;border-radius:4px;margin-top:4px;display:inline-block">via ${(PROMOTER_LIST.find(p=>p.id===e.promoterId)||{}).name||e.promoterId}</span>`
@@ -734,6 +846,14 @@ function handleSaveDate(dateKey, eventName, btn) {
 }
 
 // ── Add/Edit Event Modal (owner) ──
+function buildEventTypeOptions(selectedValue) {
+  const types = getAllEventTypes();
+  const opts = types.map(t =>
+    `<option value="${t.value}" ${t.value === selectedValue ? 'selected' : ''}>${sanitizeHTML(t.label)}</option>`
+  ).join('');
+  return opts + `<option value="__new__">＋ Create New Type...</option>`;
+}
+
 function showAddEventModal(dateKey) {
   const existing = document.getElementById('cal-event-modal');
   if (existing) existing.remove();
@@ -743,28 +863,37 @@ function showAddEventModal(dateKey) {
   modal.className = 'security-modal';
   modal.style.cssText = 'display:flex;z-index:10002';
   modal.innerHTML = `
-    <div class="security-modal-card" style="max-width:420px">
-      <div class="security-title" style="font-size:18px;margin-bottom:4px">Add Event</div>
-      <div class="security-sub" style="margin-bottom:20px">${dateKey}</div>
+    <div class="security-modal-card" style="max-width:440px">
+      <div class="security-title" style="font-size:18px;margin-bottom:20px">Add Event</div>
       <div class="form-group">
-        <label class="form-label">Event Name</label>
+        <label class="form-label">Event Name <span style="color:var(--error)">*</span></label>
         <input class="form-input" id="new-evt-name" placeholder="Event name">
       </div>
       <div class="form-group">
-        <label class="form-label">Time</label>
-        <input class="form-input" id="new-evt-time" placeholder="e.g. 10:00 PM">
+        <label class="form-label">Host / Performer Name <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+        <input class="form-input" id="new-evt-host" placeholder="e.g. DJ Khaled">
       </div>
       <div class="form-group">
-        <label class="form-label">Description</label>
-        <input class="form-input" id="new-evt-desc" placeholder="Short details">
+        <label class="form-label">Date <span style="color:var(--error)">*</span></label>
+        <input class="form-input" id="new-evt-date" type="date" value="${dateKey}" style="font-family:'Space Mono',monospace;font-size:13px">
       </div>
       <div class="form-group">
-        <label class="form-label">Type</label>
-        <select class="form-input" id="new-evt-type" style="font-family:'Space Mono',monospace;font-size:13px">
-          <option value="event">DJ / Host Night</option>
-          <option value="special">Daily Special / Promo</option>
-          <option value="reservation">Reservation</option>
+        <label class="form-label">Time <span style="color:var(--error)">*</span></label>
+        <input class="form-input" id="new-evt-time" type="time" style="font-family:'Space Mono',monospace;font-size:13px">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Type <span style="color:var(--error)">*</span></label>
+        <select class="form-input" id="new-evt-type" style="font-family:'Space Mono',monospace;font-size:13px" onchange="handleEventTypeChange('new')">
+          ${buildEventTypeOptions('event')}
         </select>
+      </div>
+      <div id="new-evt-custom-type-row" style="display:none" class="form-group">
+        <label class="form-label">New Type Name</label>
+        <input class="form-input" id="new-evt-custom-type-name" placeholder="e.g. Karaoke Night">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+        <input class="form-input" id="new-evt-desc" placeholder="Short details">
       </div>
       <div style="display:flex;gap:10px;margin-top:8px">
         <button class="btn-gold" onclick="saveNewEvent('${dateKey}')">Save Event</button>
@@ -774,20 +903,62 @@ function showAddEventModal(dateKey) {
   document.body.appendChild(modal);
 }
 
-function saveNewEvent(dateKey) {
-  const name = document.getElementById('new-evt-name').value.trim();
-  const time = document.getElementById('new-evt-time').value.trim();
-  const desc = document.getElementById('new-evt-desc').value.trim();
-  const type = document.getElementById('new-evt-type').value;
-  if (!name || !time) { showToast('Name and time are required'); return; }
+function handleEventTypeChange(prefix) {
+  const sel = document.getElementById(`${prefix}-evt-type`);
+  const row = document.getElementById(`${prefix}-evt-custom-type-row`);
+  if (sel && row) row.style.display = sel.value === '__new__' ? 'block' : 'none';
+}
 
-  const tagMap = { event: 'DJ NIGHT', special: 'DAILY SPECIAL', reservation: 'RESERVATION' };
-  if (!VENUE_EVENTS[dateKey]) VENUE_EVENTS[dateKey] = [];
-  VENUE_EVENTS[dateKey].push({ type, time, name, desc: desc || '', tag: tagMap[type] || 'EVENT', saveDate: true });
+function formatEventTime(rawTime) {
+  // rawTime is HH:MM from <input type="time">
+  if (!rawTime) return '';
+  const [h, m] = rawTime.split(':').map(Number);
+  const suffix = h >= 12 ? 'PM' : 'AM';
+  const hour = h % 12 || 12;
+  return `${hour}:${String(m).padStart(2,'0')} ${suffix}`;
+}
+
+function saveNewEvent(originalDateKey) {
+  const name     = document.getElementById('new-evt-name').value.trim();
+  const host     = document.getElementById('new-evt-host').value.trim();
+  const rawDate  = document.getElementById('new-evt-date').value;
+  const rawTime  = document.getElementById('new-evt-time').value;
+  const typeVal  = document.getElementById('new-evt-type').value;
+  const desc     = document.getElementById('new-evt-desc').value.trim();
+
+  if (!name)    { showToast('Event name is required'); return; }
+  if (!rawDate) { showToast('Date is required'); return; }
+  if (!rawTime) { showToast('Time is required'); return; }
+
+  let finalType = typeVal;
+  let finalLabel = '';
+
+  if (typeVal === '__new__') {
+    const customName = document.getElementById('new-evt-custom-type-name').value.trim();
+    if (!customName) { showToast('Enter a name for the new type'); return; }
+    finalType  = addCustomEventType(customName);
+    finalLabel = customName;
+  } else {
+    finalLabel = getAllEventTypes().find(t => t.value === typeVal)?.label || typeVal;
+  }
+
+  const timeDisplay = formatEventTime(rawTime);
+  const tag = finalLabel.toUpperCase().substring(0, 16);
+
+  if (!VENUE_EVENTS[rawDate]) VENUE_EVENTS[rawDate] = [];
+  VENUE_EVENTS[rawDate].push({
+    type:      finalType,
+    time:      timeDisplay,
+    rawTime:   rawTime,
+    name,
+    host:      host || null,
+    desc:      desc || '',
+    tag,
+    saveDate:  true,
+  });
 
   document.getElementById('cal-event-modal').remove();
   showToast(`"${name}" added to calendar`);
-  // Re-render whichever calendar is active
   if (activeCalContainerDays) {
     renderCalendar(activeCalContainerDays, activeCalContainerEvents, activeCalDate, activeCalMode);
   }
@@ -806,24 +977,40 @@ function showEditEventModal(dateKey, eventName) {
   modal.id = 'cal-event-modal';
   modal.className = 'security-modal';
   modal.style.cssText = 'display:flex;z-index:10002';
+  // Convert display time back to HH:MM for input[type=time] if rawTime is stored
+  const timeInputVal = ev.rawTime || '';
   modal.innerHTML = `
-    <div class="security-modal-card" style="max-width:420px">
+    <div class="security-modal-card" style="max-width:440px">
       <div class="security-title" style="font-size:18px;margin-bottom:20px">Edit Event</div>
       <div class="form-group">
         <label class="form-label">Event Name</label>
-        <input class="form-input" id="edit-evt-name" value="${ev.name}">
+        <input class="form-input" id="edit-evt-name" value="${sanitizeHTML(ev.name)}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Host / Performer Name <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+        <input class="form-input" id="edit-evt-host" value="${sanitizeHTML(ev.host || '')}" placeholder="e.g. DJ Khaled">
       </div>
       <div class="form-group">
         <label class="form-label">Time</label>
-        <input class="form-input" id="edit-evt-time" value="${ev.time}">
+        <input class="form-input" id="edit-evt-time" type="time" value="${timeInputVal}" style="font-family:'Space Mono',monospace;font-size:13px">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Type</label>
+        <select class="form-input" id="edit-evt-type" style="font-family:'Space Mono',monospace;font-size:13px" onchange="handleEventTypeChange('edit')">
+          ${buildEventTypeOptions(ev.type)}
+        </select>
+      </div>
+      <div id="edit-evt-custom-type-row" style="display:none" class="form-group">
+        <label class="form-label">New Type Name</label>
+        <input class="form-input" id="edit-evt-custom-type-name" placeholder="e.g. Karaoke Night">
       </div>
       <div class="form-group">
         <label class="form-label">Description</label>
-        <input class="form-input" id="edit-evt-desc" value="${ev.desc}">
+        <input class="form-input" id="edit-evt-desc" value="${sanitizeHTML(ev.desc)}">
       </div>
       <div style="display:flex;gap:10px;margin-top:8px">
-        <button class="btn-gold" onclick="updateEvent('${dateKey}','${eventName}')">Update</button>
-        <button class="btn-ghost" style="border-color:var(--error);color:var(--error)" onclick="deleteEvent('${dateKey}','${eventName}')">Delete</button>
+        <button class="btn-gold" onclick="updateEvent('${dateKey}','${eventName.replace(/'/g,"\\'")}')">Update</button>
+        <button class="btn-ghost" style="border-color:var(--error);color:var(--error)" onclick="deleteEvent('${dateKey}','${eventName.replace(/'/g,"\\'")}')">Delete</button>
         <button class="btn-ghost" onclick="document.getElementById('cal-event-modal').remove()">Cancel</button>
       </div>
     </div>`;
@@ -834,9 +1021,33 @@ function updateEvent(dateKey, oldName) {
   const evs = VENUE_EVENTS[dateKey] || [];
   const ev = evs.find(e => e.name === oldName);
   if (!ev) return;
-  ev.name = document.getElementById('edit-evt-name').value.trim() || ev.name;
-  ev.time = document.getElementById('edit-evt-time').value.trim() || ev.time;
-  ev.desc = document.getElementById('edit-evt-desc').value.trim();
+
+  const newName  = document.getElementById('edit-evt-name').value.trim()  || ev.name;
+  const newHost  = document.getElementById('edit-evt-host').value.trim();
+  const rawTime  = document.getElementById('edit-evt-time').value;
+  const typeVal  = document.getElementById('edit-evt-type').value;
+  const newDesc  = document.getElementById('edit-evt-desc').value.trim();
+
+  let finalType  = typeVal;
+  let finalLabel = '';
+
+  if (typeVal === '__new__') {
+    const customName = document.getElementById('edit-evt-custom-type-name').value.trim();
+    if (!customName) { showToast('Enter a name for the new type'); return; }
+    finalType  = addCustomEventType(customName);
+    finalLabel = customName;
+  } else {
+    finalLabel = getAllEventTypes().find(t => t.value === typeVal)?.label || typeVal;
+  }
+
+  ev.name    = newName;
+  ev.host    = newHost || null;
+  ev.type    = finalType;
+  ev.tag     = finalLabel.toUpperCase().substring(0, 16);
+  ev.rawTime = rawTime;
+  ev.time    = rawTime ? formatEventTime(rawTime) : ev.time;
+  ev.desc    = newDesc;
+
   document.getElementById('cal-event-modal').remove();
   showToast('Event updated');
   if (activeCalContainerDays) renderCalendar(activeCalContainerDays, activeCalContainerEvents, activeCalDate, activeCalMode);
@@ -855,20 +1066,43 @@ function showReserveModal(dateKey) {
   const existing = document.getElementById('reserve-modal');
   if (existing) existing.remove();
 
-  const evs = (VENUE_EVENTS[dateKey] || []).filter(e => e.type === 'event');
-  const eventName = evs[0]?.name || 'this night';
+  // Get today's date string for min attribute
+  const today = new Date();
+  const todayKey = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+  const initialDate = dateKey || todayKey;
+
+  // Build event options for the initial date
+  function buildEventOptions(dk) {
+    const memberVisibleTypes = getAllEventTypes().filter(t => t.memberVisible).map(t => t.value);
+    const evs = (VENUE_EVENTS[dk] || []).filter(e => memberVisibleTypes.includes(e.type));
+    if (!evs.length) return `<option value="">No scheduled events — general request</option>`;
+    return `<option value="">Select event (optional)</option>` +
+      evs.map(e => `<option value="${sanitizeHTML(e.name)}">${sanitizeHTML(e.name)} — ${e.time || ''}</option>`).join('');
+  }
 
   const modal = document.createElement('div');
   modal.id = 'reserve-modal';
   modal.className = 'security-modal';
   modal.style.cssText = 'display:flex;z-index:10002';
   modal.innerHTML = `
-    <div class="security-modal-card" style="max-width:400px">
+    <div class="security-modal-card" style="max-width:420px">
       <div class="security-icon">🎟️</div>
       <div class="security-title" style="font-size:18px">Request Reservation</div>
-      <div class="security-sub" style="margin-bottom:20px">For: ${eventName}</div>
+      <div class="security-sub" style="margin-bottom:20px">Select your date and details below</div>
       <div class="form-group">
-        <label class="form-label">Party Size</label>
+        <label class="form-label">Date <span style="color:var(--error)">*</span></label>
+        <input class="form-input" id="res-date" type="date" value="${initialDate}" min="${todayKey}"
+          style="font-family:'Space Mono',monospace;font-size:13px"
+          onchange="refreshReserveEventOptions()">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Event <span style="color:var(--muted);font-size:10px">(if applicable)</span></label>
+        <select class="form-input" id="res-event" style="font-family:'Space Mono',monospace;font-size:13px">
+          ${buildEventOptions(initialDate)}
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Party Size <span style="color:var(--error)">*</span></label>
         <input class="form-input" id="res-size" type="number" placeholder="How many guests?" min="1" max="20">
       </div>
       <div class="form-group">
@@ -882,22 +1116,40 @@ function showReserveModal(dateKey) {
         </select>
       </div>
       <div class="form-group">
-        <label class="form-label">Notes (optional)</label>
+        <label class="form-label">Notes <span style="color:var(--muted);font-size:10px">(optional)</span></label>
         <input class="form-input" id="res-notes" placeholder="Any special requests?">
       </div>
       <div style="display:flex;gap:10px;margin-top:8px">
-        <button class="btn-gold" onclick="submitReservation('${dateKey}', '${eventName}')">Submit Request</button>
+        <button class="btn-gold" onclick="submitReservation()">Submit Request</button>
         <button class="btn-ghost" onclick="document.getElementById('reserve-modal').remove()">Cancel</button>
       </div>
     </div>`;
   document.body.appendChild(modal);
 }
 
-function submitReservation(dateKey, eventName) {
-  const size     = document.getElementById('res-size').value;
-  const occasion = document.getElementById('res-occasion').value;
-  const notes    = document.getElementById('res-notes').value;
-  if (!size) { showToast('Please enter party size'); return; }
+function refreshReserveEventOptions() {
+  const dk  = document.getElementById('res-date')?.value;
+  const sel = document.getElementById('res-event');
+  if (!dk || !sel) return;
+  const memberVisibleTypes = getAllEventTypes().filter(t => t.memberVisible).map(t => t.value);
+  const evs = (VENUE_EVENTS[dk] || []).filter(e => memberVisibleTypes.includes(e.type));
+  if (!evs.length) {
+    sel.innerHTML = `<option value="">No scheduled events — general request</option>`;
+  } else {
+    sel.innerHTML = `<option value="">Select event (optional)</option>` +
+      evs.map(e => `<option value="${sanitizeHTML(e.name)}">${sanitizeHTML(e.name)} — ${e.time || ''}</option>`).join('');
+  }
+}
+
+function submitReservation() {
+  const dateKey   = document.getElementById('res-date')?.value;
+  const eventName = document.getElementById('res-event')?.value || 'General Request';
+  const size      = document.getElementById('res-size').value;
+  const occasion  = document.getElementById('res-occasion').value;
+  const notes     = document.getElementById('res-notes').value;
+
+  if (!dateKey) { showToast('Please select a date'); return; }
+  if (!size)    { showToast('Please enter party size'); return; }
 
   // Check if member arrived via a promoter link
   const refParam = new URLSearchParams(window.location.search).get('ref');
@@ -945,7 +1197,7 @@ function submitReservation(dateKey, eventName) {
 
   // Add to promoter guest list if referred
   if (promoter && currentMember?.name) {
-    if (!promoter.guestList.includes(currentMember.name) ) {
+    if (!promoter.guestList.includes(currentMember.name)) {
       promoter.guestList.push(currentMember.name);
     }
   }
@@ -953,6 +1205,8 @@ function submitReservation(dateKey, eventName) {
   document.getElementById('reserve-modal').remove();
   showToast('Reservation request sent! We\'ll confirm by SMS.');
 }
+
+
 
 // ── Calendar nav helpers (multiple calendar instances) ──
 function calNav(dir, labelId, daysId, eventsId, mode, staffId, promoterId) {
@@ -1065,10 +1319,11 @@ function setupStaffPortalForRole(role, staffObj) {
   // security: scan + security alert SMS only
   // owner (handled separately): everything
 
-  // Role-gate manual lookup — only manager and vip-host can text-search
+  // Role-gate manual member lookup — manager and vip-host get full search in guest list panel
+  // For scan-only roles the lookup area is hidden entirely
   const lookupDiv = document.getElementById('staff-lookup-area');
   if (lookupDiv) {
-    lookupDiv.style.display = ['manager','vip-host'].includes(role) ? 'block' : 'none';
+    lookupDiv.style.display = 'none'; // search now unified in renderStaffGuestListArea
   }
 
   // Clear any lingering member search result on every role switch
@@ -1079,6 +1334,7 @@ function setupStaffPortalForRole(role, staffObj) {
       scanArea.style.display = 'none';
       smsArea.style.display = 'block';
       renderSMSThreads(role);
+      // Barback has no scan, so no guest list check-in panel
       break;
     case 'bartender':
       scanArea.style.display = 'block';
@@ -1086,30 +1342,35 @@ function setupStaffPortalForRole(role, staffObj) {
       if (perksArea) perksArea.style.display = 'block';
       if (ptsArea) ptsArea.style.display = 'none';
       renderSMSThreads('bartender');
+      renderStaffGuestListArea(role);   // QR only
       break;
     case 'host':
       scanArea.style.display = 'block';
       smsArea.style.display = 'none';
       if (perksArea) perksArea.style.display = 'block';
       if (ptsArea) ptsArea.style.display = 'none';
+      renderStaffGuestListArea(role);   // QR only
       break;
     case 'waitress':
       scanArea.style.display = 'block';
       smsArea.style.display = 'block';
       if (ptsArea) ptsArea.style.display = 'none';
       renderSMSThreads(role, currentStaffSection);
+      renderStaffGuestListArea(role);   // QR only
       break;
     case 'doorman':
       scanArea.style.display = 'block';
       smsArea.style.display = 'block';
       renderSMSThreads(role);
-      renderDoormanGuestListArea();
+      renderStaffGuestListArea(role);   // QR only
       break;
     case 'vip-host':
     case 'manager':
       scanArea.style.display = 'block';
       smsArea.style.display = 'block';
       renderSMSThreads(role);
+      renderStaffGuestListArea(role);   // QR scan + search
+      renderStaffReservations(role);    // Can sit confirmed reservations
       break;
   }
 
@@ -1223,12 +1484,11 @@ function renderSMSThreads(role, assignedSection) {
     // Check recipient list
     if (!recipients.includes(role)) return false;
 
-    // Waitress: only see FLOOR threads assigned to her
+    // Waitress: ONLY sees FLOOR threads where she is the assigned server
+    // No fallback to recipientRoles — that was too broad and showed all floor threads
     if (role === 'waitress') {
       if (type === 'FLOOR' || t.tag === 'FLOOR') {
-        return t.waitressId === currentLoggedStaffId ||
-               (assignedSection && t.section === assignedSection) ||
-               (t.recipientRoles && t.recipientRoles.includes('waitress'));
+        return t.waitressId === currentLoggedStaffId;
       }
       return false;
     }
@@ -1447,52 +1707,119 @@ function ownerSendNewThread()   { /* Replaced by ownerSendNewCompose */ }
 
 // ─── Doorman Guest List Check-In Area ─────────────────────
 function renderDoormanGuestListArea() {
-  // Inject guest list check-in panel below SMS area in staff portal
-  const existing = document.getElementById('doorman-guestlist-area');
-  if (existing) { existing.remove(); }
+  // Alias — calls unified function
+  renderStaffGuestListArea(currentStaffRole || 'doorman');
+}
+
+// Unified guest list check-in panel.
+// Access rules:
+//   All staff roles — search by name, phone, or member ID + QR scan
+//   Result card shows member name and which list they're on only — no other member info
+function renderStaffGuestListArea(role) {
+  const existing = document.getElementById('staff-guestlist-area');
+  if (existing) existing.remove();
 
   const staffScreen = document.getElementById('staff');
   const panel = document.createElement('div');
-  panel.id = 'doorman-guestlist-area';
+  panel.id = 'staff-guestlist-area';
   panel.style.cssText = 'margin-top:24px';
   panel.innerHTML = `
-    <div class="perks-heading">Guest List Check-In</div>
+    <div class="perks-heading">Guest List</div>
     <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:14px;line-height:1.8">
-      Scan a member's QR or search by name to verify guest list arrival.
+      Scan member QR or search by name, phone, or member ID to add to guest list or verify arrival.
     </div>
     <div class="staff-lookup" style="margin-bottom:12px">
-      <input class="form-input" id="doorman-gl-search" type="text" placeholder="Member name or phone">
-      <button onclick="doormanGuestSearch()">Search</button>
+      <input class="form-input" id="gl-checkin-search" type="text"
+        placeholder="Name, phone, or member ID"
+        onkeydown="if(event.key==='Enter')glCheckinSearch()">
+      <button onclick="glCheckinSearch()">Search</button>
     </div>
-    <div id="doorman-gl-result" style="margin-bottom:12px"></div>
+    <div id="gl-checkin-result" style="margin-bottom:12px"></div>
     <div id="doorman-gl-list" style="margin-top:16px"></div>`;
   staffScreen.appendChild(panel);
   renderDoormanGuestList();
 }
 
-function doormanGuestSearch() {
-  const query = document.getElementById('doorman-gl-search')?.value?.trim().toLowerCase();
+function doormanGuestSearch() { glCheckinSearch(); } // alias
+
+function glCheckinSearch() {
+  const query = document.getElementById('gl-checkin-search')?.value?.trim().toLowerCase();
   if (!query) return;
-  // Find member in registered members list
+  // Search by name, phone, or member ID prefix
   const member = members.find(m =>
-    m.name.toLowerCase().includes(query) || m.phone.includes(query)
+    m.name.toLowerCase().includes(query) ||
+    m.phone.replace(/\D/g,'').includes(query.replace(/\D/g,'')) ||
+    (m.id || '').toLowerCase().startsWith(query)
   );
-  const resultEl = document.getElementById('doorman-gl-result');
+  const resultEl = document.getElementById('gl-checkin-result');
+  if (!resultEl) return;
+
+  // Not a registered member — SMS invite required
   if (!member) {
-    resultEl.innerHTML = `<div style="font-family:'Space Mono',monospace;font-size:11px;color:var(--error);padding:10px 0">No registered member found</div>`;
-    return;
-  }
-  // Check if on any promoter guest list
-  const match = findMemberOnGuestList(member.id, member.name);
-  if (!match) {
     resultEl.innerHTML = `
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px">
-        <div style="font-size:15px;color:var(--text);margin-bottom:4px">${sanitizeHTML(member.name)}</div>
-        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">Registered member — not on any guest list tonight</div>
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--error);margin-bottom:8px">NOT A REGISTERED MEMBER</div>
+        <div style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted);margin-bottom:12px">Send them a link to join Riddim Members Club?</div>
+        <button class="cal-save-btn" style="border-color:var(--accent);color:var(--accent);width:100%" onclick="glSendJoinInvite('${query.replace(/'/g,"\\'")}')">📲 Send SMS Join Invite</button>
       </div>`;
     return;
   }
-  showDoormanArrivalCard(member, match);
+
+  const match = findMemberOnGuestList(member.id, member.name);
+  if (!match) {
+    // Member found but not on any list — show name only + add to list option
+    const activePromoters = PROMOTER_LIST.filter(p => p.active && p.nights?.length);
+    const promoterOptions = activePromoters.length
+      ? activePromoters.map(p => `<option value="${p.id}">${sanitizeHTML(p.name)}</option>`).join('')
+      : '<option value="">No active promoters tonight</option>';
+    resultEl.innerHTML = `
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px">
+        <div style="font-size:15px;color:var(--text);margin-bottom:4px">${sanitizeHTML(member.name)}</div>
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:12px">Member · Not on any list tonight</div>
+        ${activePromoters.length ? `
+        <select class="form-input" id="gl-add-promoter-select" style="padding:8px;font-size:11px;font-family:'Space Mono',monospace;margin-bottom:10px">
+          ${promoterOptions}
+        </select>
+        <button class="cal-save-btn" style="border-color:#34D399;color:#34D399;width:100%" onclick="glAddMemberToList('${member.id}','${member.name.replace(/'/g,"\\'")}')">+ Add to Guest List</button>` :
+        `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--dim)">No active promoter lists tonight</div>`}
+      </div>`;
+    setTimeout(() => { if (resultEl) resultEl.innerHTML = ''; }, 10000);
+    return;
+  }
+  glShowArrivalCard(member, match);
+}
+
+// Send a DEV mock SMS join invite to a non-member
+function glSendJoinInvite(queryHint) {
+  const resultEl = document.getElementById('gl-checkin-result');
+  console.log(`[DEV] SMS join invite triggered — query: "${queryHint}" — replace with Twilio /send-invite endpoint`);
+  showToast('Join invite sent via SMS');
+  if (resultEl) {
+    resultEl.innerHTML = `<div style="font-family:'Space Mono',monospace;font-size:11px;color:#34D399;padding:10px 0">✓ Join invite sent</div>`;
+    setTimeout(() => { if (resultEl) resultEl.innerHTML = ''; const s = document.getElementById('gl-checkin-search'); if (s) s.value = ''; }, 3000);
+  }
+}
+
+// Add a found member to a specific promoter's guest list
+function glAddMemberToList(memberId, memberName) {
+  const promoterId = document.getElementById('gl-add-promoter-select')?.value;
+  const promoter = PROMOTER_LIST.find(p => p.id === promoterId);
+  if (!promoter) { showToast('Select a promoter list'); return; }
+
+  const already = promoter.guestList.find(g =>
+    (typeof g === 'object' && g.memberId === memberId) ||
+    (typeof g === 'string' && g.toLowerCase() === memberName.toLowerCase())
+  );
+  if (already) { showToast(`${memberName} is already on ${promoter.name}'s list`); return; }
+
+  promoter.guestList.push({ name: memberName, memberId, arrived: false });
+  showToast(`${memberName} added to ${promoter.name}'s list`);
+  renderDoormanGuestList();
+  const resultEl = document.getElementById('gl-checkin-result');
+  if (resultEl) {
+    resultEl.innerHTML = `<div style="font-family:'Space Mono',monospace;font-size:11px;color:#34D399;padding:10px 0">✓ ${sanitizeHTML(memberName)} added to ${sanitizeHTML(promoter.name)}'s list</div>`;
+    setTimeout(() => { if (resultEl) resultEl.innerHTML = ''; const s = document.getElementById('gl-checkin-search'); if (s) s.value = ''; }, 3000);
+  }
 }
 
 function findMemberOnGuestList(memberId, memberName) {
@@ -1507,10 +1834,16 @@ function findMemberOnGuestList(memberId, memberName) {
 }
 
 function showDoormanArrivalCard(member, match) {
+  glShowArrivalCard(member, match);
+}
+
+function glShowArrivalCard(member, match) {
   const { promoter, idx } = match;
   const guest = promoter.guestList[idx];
   const alreadyArrived = guest?.arrived || false;
-  const resultEl = document.getElementById('doorman-gl-result');
+  // Use unified result div — falls back to doorman-gl-result for backward compat
+  const resultEl = document.getElementById('gl-checkin-result') || document.getElementById('doorman-gl-result');
+  if (!resultEl) return;
   resultEl.innerHTML = `
     <div style="background:var(--bg2);border:1px solid ${alreadyArrived ? '#34D399' : 'var(--accent)'};border-radius:10px;padding:14px">
       <div style="font-size:15px;color:var(--text);margin-bottom:2px">${sanitizeHTML(member.name)}</div>
@@ -1522,6 +1855,10 @@ function showDoormanArrivalCard(member, match) {
         : `<button class="btn-gold" style="padding:12px;font-size:13px" onclick="markGuestArrived('${promoter.id}',${idx},'${member.id}','${member.name.replace(/'/g,"\\'")}')">✓ Mark Arrived</button>`
       }
     </div>`;
+  // Auto-clear after 6 s so result never persists across sessions
+  if (!alreadyArrived) {
+    setTimeout(() => { if (resultEl) resultEl.innerHTML = ''; }, 6000);
+  }
 }
 
 function markGuestArrived(promoterId, idx, memberId, memberName) {
@@ -1538,9 +1875,15 @@ function markGuestArrived(promoterId, idx, memberId, memberName) {
   }
   showToast(`${memberName} marked as arrived on ${sanitizeHTML(promoter.name)}'s list`);
   renderDoormanGuestList();
-  // Refresh arrival card to show confirmed state
+  // Refresh arrival card to show confirmed state, then auto-clear after 5 s
   const member = members.find(m => m.id === memberId) || { id: memberId, name: memberName };
-  showDoormanArrivalCard(member, { promoter, idx });
+  glShowArrivalCard(member, { promoter, idx });
+  setTimeout(() => {
+    const r = document.getElementById('gl-checkin-result') || document.getElementById('doorman-gl-result');
+    if (r) r.innerHTML = '';
+    const s = document.getElementById('gl-checkin-search');
+    if (s) s.value = '';
+  }, 5000);
 }
 
 function renderDoormanGuestList() {
@@ -1572,24 +1915,42 @@ function renderDoormanGuestList() {
   }).join('');
 }
 
-// QR scan path for doorman guest list check-in
+// QR scan path for guest list check-in — all staff roles
 function doormanScanForGuestList(memberId) {
+  const resultEl = document.getElementById('gl-checkin-result') || document.getElementById('doorman-gl-result');
   const member = members.find(m => m.id === memberId);
   if (!member) {
-    document.getElementById('doorman-gl-result').innerHTML =
-      `<div style="font-family:'Space Mono',monospace;font-size:11px;color:var(--error);padding:10px 0">Member not found in system</div>`;
+    // QR scanned but no member record — show SMS invite option
+    if (resultEl) resultEl.innerHTML = `
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px">
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--error);margin-bottom:8px">NOT A REGISTERED MEMBER</div>
+        <div style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted);margin-bottom:12px">Send them a link to join Riddim Members Club?</div>
+        <button class="cal-save-btn" style="border-color:var(--accent);color:var(--accent);width:100%" onclick="glSendJoinInvite('${memberId}')">📲 Send SMS Join Invite</button>
+      </div>`;
     return;
   }
   const match = findMemberOnGuestList(member.id, member.name);
   if (!match) {
-    document.getElementById('doorman-gl-result').innerHTML = `
+    // Member exists but not on a list — show name only + add to list option
+    const activePromoters = PROMOTER_LIST.filter(p => p.active && p.nights?.length);
+    const promoterOptions = activePromoters.length
+      ? activePromoters.map(p => `<option value="${p.id}">${sanitizeHTML(p.name)}</option>`).join('')
+      : '<option value="">No active promoters tonight</option>';
+    if (resultEl) resultEl.innerHTML = `
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px">
         <div style="font-size:15px;color:var(--text);margin-bottom:4px">${sanitizeHTML(member.name)}</div>
-        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">Registered member — not on any guest list tonight</div>
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:12px">Member · Not on any list tonight</div>
+        ${activePromoters.length ? `
+        <select class="form-input" id="gl-add-promoter-select" style="padding:8px;font-size:11px;font-family:'Space Mono',monospace;margin-bottom:10px">
+          ${promoterOptions}
+        </select>
+        <button class="cal-save-btn" style="border-color:#34D399;color:#34D399;width:100%" onclick="glAddMemberToList('${member.id}','${member.name.replace(/'/g,"\\'")}')">+ Add to Guest List</button>` :
+        `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--dim)">No active promoter lists tonight</div>`}
       </div>`;
+    setTimeout(() => { if (resultEl) resultEl.innerHTML = ''; }, 10000);
     return;
   }
-  showDoormanArrivalCard(member, match);
+  glShowArrivalCard(member, match);
 }
 
 
@@ -1936,6 +2297,9 @@ function handleRegister() {
   if (location.hostname === 'localhost' || location.hostname.includes('github.io') ) {
     console.info('[DEV] SMS code:', sentCode);
   }
+  // DEV banner — shows code on screen for any device (iPhone, Mac, etc). Remove before production.
+  const _devB = document.getElementById('dev-2fa-banner');
+  if (_devB) { _devB.textContent = `DEV CODE: ${sentCode}`; _devB.style.display = 'block'; setTimeout(() => { _devB.style.display = 'none'; }, 30000); }
   go('sms');
 }
 
@@ -2167,6 +2531,13 @@ async function handleReturningLogin() {
 
   const member = normalizeRow(data);
 
+  // Check if account is locked
+  if (isAccountLocked(member.phone)) {
+    err.textContent = 'Account locked — contact the venue to restore access';
+    err.style.display = 'block';
+    return;
+  }
+
   const proceed = async () => {
     currentMember = member;
     perkClaimed   = {};
@@ -2185,7 +2556,7 @@ async function handleReturningLogin() {
       } else {
         proceed();
       }
-    });
+    }, member.phone);
   } else {
     proceed();
   }
@@ -2229,20 +2600,7 @@ function switchRetTab(tab, el) {
 }
 
 // ─── Staff Portal ─────────────────────────────────────────
-function handleStaffAuth() {
-  const pin = document.getElementById('staff-pin').value;
-  const err = document.getElementById('staff-error');
-  if (!currentStaffRole) { err.style.display = 'block'; return; }
-  // Auth is handled by personal passcode only — no shared role PINs
-  const staffMatch = STAFF_LIST.find(s => s.passcode === pin && s.active);
-  if (staffMatch || verifyOwnerPasscode(pin) ) {
-    err.style.display = 'none';
-    go('staff');
-    setupStaffPortalForRole(currentStaffRole);
-  } else {
-    err.style.display = 'block';
-  }
-}
+// handleStaffAuth stub removed — see full implementation below
 
 // ─── DEV TOOLS — remove before production ─────────────────
 function devClearSession() {
@@ -2268,6 +2626,13 @@ function clearStaffMemberResult() {
   if (result) result.style.display = 'none';
   const search = document.getElementById('staff-search');
   if (search) search.value = '';
+  // Also clear guest-list check-in panel and result so it never persists across logins
+  const glResult = document.getElementById('gl-checkin-result');
+  if (glResult) glResult.innerHTML = '';
+  const glSearch = document.getElementById('gl-checkin-search');
+  if (glSearch) glSearch.value = '';
+  const glArea = document.getElementById('staff-guestlist-area');
+  if (glArea) glArea.remove();
 }
 
 let staffResultTimer = null;
@@ -2365,11 +2730,11 @@ async function startScanner() {
             if (code && code.data.startsWith('RIDDIM-MEMBER-') ) {
               const memberId = code.data.replace('RIDDIM-MEMBER-', '');
               stopScanner();
-              if (currentStaffRole === 'doorman' && document.getElementById('doorman-guestlist-area') ) {
-                await lookupMemberById(memberId);
+              // Always attempt guest list check-in via QR for any staff role
+              // showStaffMember handles perk/points display for scan-in roles
+              await lookupMemberById(memberId);
+              if (document.getElementById('staff-guestlist-area') || document.getElementById('doorman-guestlist-area')) {
                 doormanScanForGuestList(memberId);
-              } else {
-                await lookupMemberById(memberId);
               }
             }
           }
@@ -2429,8 +2794,8 @@ function switchOwnerTab(tab, el) {
   if (tab === 'staff')    { renderOwnerStaff(); setTimeout(renderWhoIsOnDuty, 50); }
   if (tab === 'messages') renderOwnerMessages();
   if (tab === 'tickets')  { renderOwnerPricing(); renderOwnerComps(); }
-  if (tab === 'calendar') { setTimeout(initOwnerCalendar, 50); renderOwnerReservations(); renderOwnerSalesLog(); }
-  if (tab === 'schedule') { renderSchedulePanel('owner'); }
+  if (tab === 'calendar') { setTimeout(() => { renderOwnerCalendarSubs(); initOwnerCalendar(); renderOwnerReservations(); renderOwnerSalesLog(); }, 50); }
+  if (tab === 'schedule') { renderSchedulePanel('owner'); setTimeout(initOwnerScheduleCalendar, 50); }
 }
 
 function renderOwnerMessages() {
@@ -2703,15 +3068,205 @@ async function renderOwnerDashboard() {
   }
   await loadMembers();
   const now = new Date();
-  const tonight   = members.filter(m => new Date(m.joined).toDateString() === now.toDateString().length);
-  const thisMonth = members.filter(m => new Date(m.joined) > new Date(now.getFullYear(), now.getMonth(), 1).length);
-  const totalPts  = members.reduce((s, m) => s + m.points, 0);
-  const bdayCount = members.filter(m => m.dob && new Date(m.dob).getMonth() === now.getMonth().length);
+  const startOfToday  = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfMonth  = new Date(now.getFullYear(), now.getMonth(), 1);
+  const tonightList   = members.filter(m => new Date(m.joined) >= startOfToday);
+  const thisMonthList = members.filter(m => new Date(m.joined) >= startOfMonth);
+  const totalPts      = members.reduce((s, m) => s + m.points, 0);
+  const bdayList      = members.filter(m => m.dob && new Date(m.dob + 'T00:00:00').getMonth() === now.getMonth());
+
   document.getElementById('ow-total').textContent   = members.length;
   document.getElementById('ow-pts').textContent     = totalPts;
-  document.getElementById('ow-tonight').textContent = tonight;
-  document.getElementById('ow-bday').textContent    = bdayCount;
-  document.getElementById('ow-new').textContent     = '+' + thisMonth + ' this month';
+  document.getElementById('ow-tonight').textContent = tonightList.length;
+  document.getElementById('ow-bday').textContent    = bdayList.length;
+  document.getElementById('ow-new').textContent     = `+${thisMonthList.length} this month`;
+
+  // Store data for card drilldowns
+  window._ownerCardData = {
+    total:   members,
+    pts:     [...members].sort((a,b) => b.points - a.points),
+    tonight: tonightList,
+    bday:    bdayList,
+  };
+}
+
+let _activeOverviewCard = null;
+
+function toggleOverviewCard(card) {
+  const panel = document.getElementById('overview-drilldown');
+  if (!panel) return;
+
+  if (_activeOverviewCard === card) {
+    _activeOverviewCard = null;
+    panel.style.display = 'none';
+    document.querySelectorAll('.metric-card').forEach(c => c.classList.remove('card-active'));
+    return;
+  }
+
+  _activeOverviewCard = card;
+  document.querySelectorAll('.metric-card').forEach(c => c.classList.remove('card-active'));
+  document.querySelector(`.metric-card[data-card="${card}"]`)?.classList.add('card-active');
+
+  const data = window._ownerCardData || {};
+  const list = data[card] || [];
+
+  const titles = {
+    total:   'All Members',
+    pts:     'Points Leaders',
+    tonight: 'Joined Tonight',
+    bday:    'Birthdays This Month',
+  };
+
+  let html = `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.1em;margin-bottom:12px">${titles[card] || ''} (${list.length})</div>`;
+
+  if (!list.length) {
+    html += `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--dim);padding:12px 0">No records</div>`;
+  } else {
+    html += list.map(m => {
+      const locked = isAccountLocked(m.phone);
+      const dob = m.dob ? new Date(m.dob + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric' }) : '—';
+      return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border)">
+        <div>
+          <div style="font-size:13px;color:var(--text)">${sanitizeHTML(m.name)}${locked ? ' <span style=\'font-family:Space Mono,monospace;font-size:8px;padding:1px 6px;border-radius:4px;background:rgba(239,68,68,0.12);color:#EF4444;border:1px solid rgba(239,68,68,0.3)\'>LOCKED</span>' : ''}</div>
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:2px">${sanitizeHTML(m.phone)}${card === 'bday' ? ' · DOB: ' + dob : ''}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-family:'Space Mono',monospace;font-size:12px;color:var(--accent)">${m.points}pts</div>
+          ${locked ? `<button onclick="ownerUnlockAccount('${m.phone}','${m.name.replace(/'/g, "\\'")}');toggleOverviewCard('${card}')" style="font-family:'Space Mono',monospace;font-size:8px;padding:3px 7px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.4);border-radius:4px;color:#EF4444;cursor:pointer;margin-top:4px">Unlock</button>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  panel.innerHTML = html;
+  panel.style.display = 'block';
+}
+
+let _expandedMemberId = null;
+
+// ─── Owner — Manual Member Creation ──────────────────────
+let _ownerCreateMemberPending = null; // holds { name, phone, email, dob } during 2FA
+
+function showOwnerAddMemberModal() {
+  const existing = document.getElementById('owner-add-member-modal');
+  if (existing) existing.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'owner-add-member-modal';
+  modal.className = 'security-modal';
+  modal.style.cssText = 'display:flex;z-index:10002';
+  modal.innerHTML = `
+    <div class="security-modal-card" style="max-width:440px">
+      <div class="security-title" style="font-size:18px;margin-bottom:4px">Add Member</div>
+      <div class="security-sub" style="margin-bottom:20px">A verification code will be sent to the member's phone.</div>
+      <div class="form-group">
+        <label class="form-label">Full Name <span style="color:var(--error)">*</span></label>
+        <input class="form-input" id="owner-new-member-name" placeholder="First and last name" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Phone <span style="color:var(--error)">*</span></label>
+        <input class="form-input" id="owner-new-member-phone" type="tel" placeholder="+1 (305) 555-0000" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Email <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+        <input class="form-input" id="owner-new-member-email" type="email" placeholder="email@example.com" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Date of Birth <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+        <input class="form-input" id="owner-new-member-dob" type="date" style="font-family:'Space Mono',monospace;font-size:13px">
+      </div>
+      <div style="display:flex;gap:10px;margin-top:8px">
+        <button class="btn-gold" onclick="ownerInitMemberCreate()">Send Verification Code</button>
+        <button class="btn-ghost" onclick="document.getElementById('owner-add-member-modal').remove()">Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+function ownerInitMemberCreate() {
+  const name  = document.getElementById('owner-new-member-name')?.value.trim();
+  const phone = document.getElementById('owner-new-member-phone')?.value.trim();
+  const email = document.getElementById('owner-new-member-email')?.value.trim();
+  const dob   = document.getElementById('owner-new-member-dob')?.value;
+
+  if (!name || name.length < 2)  { showToast('Enter member full name'); return; }
+  if (!phone || phone.length < 7) { showToast('Enter a valid phone number'); return; }
+
+  // Check for duplicate phone
+  if (members.some(m => m.phone === phone)) {
+    showToast('A member with this phone already exists');
+    return;
+  }
+
+  _ownerCreateMemberPending = { name, phone, email: email || null, dob: dob || null };
+
+  // Close the form modal first
+  const modal = document.getElementById('owner-add-member-modal');
+  if (modal) modal.remove();
+
+  // Fire 2FA to the member's phone
+  show2FA(
+    `Sending verification code to ${phone} to confirm this number.`,
+    () => ownerCompleteMemberCreate(),
+    null
+  );
+}
+
+async function ownerCompleteMemberCreate() {
+  const pending = _ownerCreateMemberPending;
+  if (!pending) return;
+  _ownerCreateMemberPending = null;
+
+  const { name, phone, email, dob } = pending;
+  const nameParts = name.trim().split(' ');
+  const first = nameParts[0];
+  const last  = nameParts.slice(1).join(' ') || '-';
+
+  const client = getDb();
+
+  if (client) {
+    try {
+      const { data: inserted, error } = await client
+        .from('members')
+        .insert([{
+          first_name: first, last_name: last, phone,
+          email: email || null,
+          date_of_birth: dob || null,
+          total_points: 0, total_visits: 0, status: 'active'
+        }])
+        .select()
+        .single();
+
+      if (error) {
+        if (error.code === '23505' || (error.message && error.message.includes('duplicate'))) {
+          showToast('Member with this phone already exists');
+        } else {
+          console.warn('Owner member insert error:', error.message);
+          showToast('Error creating member — check console');
+        }
+        return;
+      }
+
+      const newMember = normalizeRow(inserted);
+      members.unshift(newMember);
+      showToast(`${name} added as a member ✓`);
+    } catch(e) {
+      console.error('Owner member create error:', e);
+      showToast('Error creating member');
+      return;
+    }
+  } else {
+    // Offline fallback
+    const newMember = {
+      id: 'LOCAL-' + Math.random().toString(36).substr(2,9).toUpperCase(),
+      name, phone, email: email || null, dob: dob || null,
+      joined: new Date().toISOString(), points: 0, visits: 0,
+    };
+    members.unshift(newMember);
+    showToast(`${name} added as a member ✓`);
+  }
+
+  renderOwnerMembers(document.getElementById('owner-search')?.value || '');
 }
 
 function renderOwnerMembers(filter) {
@@ -2721,27 +3276,64 @@ function renderOwnerMembers(filter) {
     ? members.filter(m =>
         m.name.toLowerCase().includes(query) ||
         m.phone.includes(query) ||
-        m.email.toLowerCase().includes(query)
+        (m.email || '').toLowerCase().includes(query)
       )
     : members;
   if (!filtered.length) {
     list.innerHTML = '<div style="padding:32px 0;text-align:center;color:var(--muted);font-family:Space Mono,monospace;font-size:12px">No members found</div>';
     return;
   }
-  list.innerHTML = filtered.map(m =>
-    `<div class="member-row">
-      <img class="member-row-qr" src="${qrUrl('RIDDIM-MEMBER-' + m.id, 60)}" alt="QR">
-      <div class="member-row-info">
-        <div class="member-row-name">${sanitizeHTML(m.name)}</div>
-        <div class="member-row-contact">${sanitizeHTML(m.phone)}</div>
-        <div class="member-row-contact">${m.email}</div>
+  list.innerHTML = filtered.map(m => {
+    const locked = isAccountLocked(m.phone);
+    const isExpanded = _expandedMemberId === m.id;
+    const dob = m.dob ? new Date(m.dob + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : 'Not provided';
+    const joined = new Date(m.joined).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+    const detail = isExpanded ? `
+      <div class="member-detail-panel" style="margin-top:12px;padding:14px;background:var(--bg);border:1px solid var(--border);border-radius:10px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;font-family:'Space Mono',monospace;font-size:10px">
+          <div><div style="color:var(--muted);margin-bottom:2px">PHONE</div><div style="color:var(--text)">${sanitizeHTML(m.phone)}</div></div>
+          <div><div style="color:var(--muted);margin-bottom:2px">EMAIL</div><div style="color:var(--text)">${sanitizeHTML(m.email || '—')}</div></div>
+          <div><div style="color:var(--muted);margin-bottom:2px">DATE OF BIRTH</div><div style="color:var(--text)">${dob}</div></div>
+          <div><div style="color:var(--muted);margin-bottom:2px">MEMBER SINCE</div><div style="color:var(--text)">${joined}</div></div>
+          <div><div style="color:var(--muted);margin-bottom:2px">POINTS</div><div style="color:var(--accent)">${m.points}</div></div>
+          <div><div style="color:var(--muted);margin-bottom:2px">VISITS</div><div style="color:var(--text)">${m.visits || 0}</div></div>
+          <div style="grid-column:1/-1"><div style="color:var(--muted);margin-bottom:2px">MEMBER ID</div><div style="color:var(--text);word-break:break-all">${m.id}</div></div>
+          <div style="grid-column:1/-1"><div style="color:var(--muted);margin-bottom:2px">ACCOUNT STATUS</div>
+            <div style="display:flex;align-items:center;gap:10px">
+              ${locked
+                ? `<span style="color:#EF4444;border:1px solid rgba(239,68,68,0.4);padding:2px 8px;border-radius:4px;font-size:9px">🔒 LOCKED</span>
+                   <button onclick="ownerUnlockAccount('${m.phone}','${m.name.replace(/'/g, "\\'")}');renderOwnerMembers(document.getElementById('owner-search').value)" style="font-family:'Space Mono',monospace;font-size:9px;padding:4px 10px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.4);border-radius:6px;color:#EF4444;cursor:pointer">Unlock Account</button>`
+                : `<span style="color:#34D399;border:1px solid rgba(52,211,153,0.4);padding:2px 8px;border-radius:4px;font-size:9px">✓ ACTIVE</span>`
+              }
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <img src="${qrUrl('RIDDIM-MEMBER-' + m.id, 80)}" alt="QR" style="border-radius:6px">
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);line-height:1.8;padding-top:4px">QR CODE<br>Scan at entry to verify membership</div>
+        </div>
+      </div>` : '';
+    return `<div class="member-row" style="flex-direction:column;align-items:stretch;cursor:pointer;${isExpanded ? 'border-color:var(--accent)' : ''}" onclick="toggleMemberDetail('${m.id}')">
+      <div style="display:flex;align-items:center;gap:12px">
+        <img class="member-row-qr" src="${qrUrl('RIDDIM-MEMBER-' + m.id, 60)}" alt="QR">
+        <div class="member-row-info" style="flex:1">
+          <div class="member-row-name">${sanitizeHTML(m.name)}${locked ? ' <span style=\'font-family:Space Mono,monospace;font-size:8px;padding:1px 5px;border-radius:3px;background:rgba(239,68,68,0.12);color:#EF4444;border:1px solid rgba(239,68,68,0.3)\'>LOCKED</span>' : ''}</div>
+          <div class="member-row-contact">${sanitizeHTML(m.phone)}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div class="member-row-pts">${m.points}pts</div>
+          <div class="member-row-date">${new Date(m.joined).toLocaleDateString()}</div>
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:2px">${isExpanded ? '▲' : '▼'}</div>
+        </div>
       </div>
-      <div>
-        <div class="member-row-pts">${m.points}pts</div>
-        <div class="member-row-date">${new Date(m.joined).toLocaleDateString()}</div>
-      </div>
-    </div>`
-  ).join('');
+      ${detail}
+    </div>`;
+  }).join('');
+}
+
+function toggleMemberDetail(memberId) {
+  _expandedMemberId = _expandedMemberId === memberId ? null : memberId;
+  renderOwnerMembers(document.getElementById('owner-search')?.value || '');
 }
 
 function ownerSearch() {
@@ -3403,14 +3995,25 @@ function addPromoterGuest() {
   const query = input?.value?.trim().toLowerCase();
   if (!query) return;
 
-  // Require a registered member — search by name or phone
+  // Search by name or phone
   const member = members.find(m =>
     m.name.toLowerCase() === query ||
     m.phone.replace(/\D/g,'').includes(query.replace(/\D/g,''))
   );
 
   if (!member) {
-    showToast('No registered member found — guest must be a registered Riddim member');
+    // Not a member — show SMS invite confirmation in a toast-style inline block
+    const container = document.getElementById('promoter-guestlist');
+    const inviteHtml = `
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:12px" id="promoter-invite-card">
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--error);margin-bottom:6px">NOT A REGISTERED MEMBER</div>
+        <div style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted);margin-bottom:10px">Send them a link to join Riddim Members Club?</div>
+        <div style="display:flex;gap:8px">
+          <button class="cal-save-btn" style="border-color:var(--accent);color:var(--accent);flex:1" onclick="promoterSendJoinInvite('${query.replace(/'/g,"\\'")}')">📲 Send SMS Invite</button>
+          <button class="cal-save-btn" style="flex:1" onclick="document.getElementById('promoter-invite-card')?.remove()">Cancel</button>
+        </div>
+      </div>`;
+    if (container) container.insertAdjacentHTML('afterbegin', inviteHtml);
     return;
   }
 
@@ -3430,6 +4033,14 @@ function addPromoterGuest() {
   renderPromoterGuestList();
   renderPromoterStats();
   showToast(`${sanitizeHTML(member.name)} added to guest list`);
+}
+
+function promoterSendJoinInvite(queryHint) {
+  console.log(`[DEV] Promoter SMS join invite — query: "${queryHint}" — replace with Twilio /send-invite endpoint`);
+  document.getElementById('promoter-invite-card')?.remove();
+  const input = document.getElementById('promoter-guest-input');
+  if (input) input.value = '';
+  showToast('Join invite sent via SMS');
 }
 
 function removePromoterGuest(idx) {
@@ -3479,7 +4090,27 @@ function handleStaffAuth() {
   // Send 2FA to staff phone then proceed
   const matchedMember = staffMatch || promoterMatch;
   if (matchedMember) {
-    show2FA(`We sent a 6-digit code to ${phone} to verify your identity.`, () => {
+    // Check if account is locked
+    if (isAccountLocked(matchedMember.phone)) {
+      err.textContent = 'Account locked — contact owner to restore access';
+      err.style.display = 'block';
+      return;
+    }
+
+    // Staff device trust — same conditional protocol as members
+    // Key staff by their phone number (stable identifier)
+    const staffTrustKey = 'staff::' + matchedMember.phone;
+    const skipTwoFA = isDeviceTrusted(staffTrustKey) && (
+      (() => {
+        const last = getLastLoginTime(staffTrustKey);
+        if (!last) return false;
+        const daysSince = (Date.now() - last) / (1000 * 60 * 60 * 24);
+        return daysSince < 14;
+      })()
+    );
+
+    const proceedToPortal = () => {
+      setLastLoginTime(staffTrustKey);
       go('staff');
       if (promoterMatch) {
         currentStaffRole = 'promoter';
@@ -3493,7 +4124,20 @@ function handleStaffAuth() {
         currentLoggedStaffId = staffMatch.id;
         setupStaffPortalForRole(staffMatch.role, staffMatch);
       }
-    });
+    };
+
+    if (skipTwoFA) {
+      proceedToPortal();
+    } else {
+      show2FA(`We sent a 6-digit code to ${phone} to verify your identity.`, () => {
+        // After 2FA success — offer device trust (same as member flow)
+        if (!isDeviceTrusted(staffTrustKey)) {
+          showDeviceTrustPrompt(staffTrustKey, proceedToPortal);
+        } else {
+          proceedToPortal();
+        }
+      }, matchedMember.phone);
+    }
   } else {
     // Owner override — skip 2FA, use passcode directly
     go('staff');
@@ -3578,7 +4222,389 @@ function logSaleAndFireThread(sale) {
   }
 }
 
+// ─── Staff Reservations Panel (manager / vip-host) ─────────
+// Renders after SMS threads. Shows confirmed reservations only.
+// Sitting and waitress assignment shared with owner flow.
+function renderStaffReservations(role) {
+  const existing = document.getElementById('staff-reservations-area');
+  if (existing) existing.remove();
+
+  const staffScreen = document.getElementById('staff');
+  const panel = document.createElement('div');
+  panel.id = 'staff-reservations-area';
+  panel.style.cssText = 'margin-top:24px';
+  staffScreen.appendChild(panel);
+  _refreshStaffReservations(role);
+}
+
+function _refreshStaffReservations(role) {
+  const panel = document.getElementById('staff-reservations-area');
+  if (!panel) return;
+
+  const confirmed = RESERVATION_QUEUE.filter(r => r.status === 'confirmed');
+  const sat       = RESERVATION_QUEUE.filter(r => r.status === 'sat');
+  const waitresses = STAFF_LIST.filter(s => s.role === 'waitress' && s.active);
+
+  panel.innerHTML = `<div class="perks-heading" style="margin-top:0">Reservations</div>`;
+  panel.innerHTML += `<button class="cal-save-btn" style="border-color:var(--accent);color:var(--accent);margin-bottom:16px;width:100%" onclick="showWalkInModal('staff','${role}')">🚶 Seat Walk-In</button>`;
+
+  if (!confirmed.length && !sat.length) {
+    panel.innerHTML += `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--dim);padding:10px 0">No confirmed reservations awaiting seat</div>`;
+    return;
+  }
+
+  // Floor plan overview
+  panel.innerHTML += `
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px">
+      ${renderFloorPlan('view', null)}
+      <div style="display:flex;gap:12px;margin-top:10px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:var(--bg2);border:1px solid var(--border)"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:var(--muted)">AVAILABLE</span></div>
+        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:rgba(245,200,66,0.08);border:1px solid var(--acid)"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:var(--acid)">RESERVED</span></div>
+        <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:3px;background:#34D39912;border:1px solid #34D399"></div><span style="font-family:'Space Mono',monospace;font-size:8px;color:#34D399">SAT</span></div>
+      </div>
+    </div>`;
+
+  if (confirmed.length) {
+    panel.innerHTML += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#60A5FA;letter-spacing:0.08em;margin-bottom:8px">CONFIRMED — AWAITING SEAT (${confirmed.length})</div>`;
+    panel.innerHTML += confirmed.map(r => `
+      <div class="sms-thread" style="margin-bottom:12px" id="staff-res-card-${r.id}">
+        <div class="sms-thread-header">
+          <div>
+            <div class="sms-thread-title">${sanitizeHTML(r.memberName)}</div>
+            <div class="sms-msg-meta" style="margin-top:3px">${r.partySize} guests · ${r.occasion} · ${r.eventName || 'General'}</div>
+            ${r.tableAssigned ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);margin-top:2px">📍 Table ${r.tableAssigned}</div>` : ''}
+          </div>
+          <span style="font-family:'Space Mono',monospace;font-size:9px;padding:3px 8px;border-radius:4px;background:#60A5FA18;color:#60A5FA;border:1px solid #60A5FA40">CONFIRMED</span>
+        </div>
+        ${r.notes ? `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-top:6px">"${sanitizeHTML(r.notes)}"</div>` : ''}
+        <div style="margin-top:12px">
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:8px">ASSIGN TABLE — TAP TO SELECT</div>
+          <div id="staff-floor-plan-${r.id}" style="margin-bottom:12px">
+            ${renderFloorPlan('select', r.id)}
+          </div>
+          <select class="form-input" style="padding:8px;font-size:11px;font-family:'Space Mono',monospace;margin-bottom:10px" id="staff-res-waitress-${r.id}">
+            <option value="">Assign waitress...</option>
+            ${waitresses.map(w => `<option value="${w.id}" ${r.waitressAssigned===w.id?'selected':''}>${w.name}</option>`).join('')}
+          </select>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:4px">
+          <button class="cal-save-btn" style="border-color:#34D399;color:#34D399"
+            onclick="staffMarkTableSat('${r.id}','${role}')">🪑 Table Sat — Add Server</button>
+        </div>
+      </div>`).join('');
+  }
+
+  if (sat.length) {
+    panel.innerHTML += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;letter-spacing:0.08em;margin:16px 0 8px">SEATED (${sat.length})</div>`;
+    panel.innerHTML += sat.map(r => `
+      <div class="sms-thread" style="margin-bottom:8px">
+        <div style="font-size:13px;color:var(--text)">${sanitizeHTML(r.memberName)}</div>
+        <div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;margin-top:4px">
+          ✓ Table ${r.tableAssigned} sat
+          ${r.waitressAssigned ? ' · ' + (STAFF_LIST.find(s=>s.id===r.waitressAssigned)?.name || 'Server') : ''}
+        </div>
+      </div>`).join('');
+  }
+}
+
+// Staff portal wrapper for markTableSat — reads from staff-specific form IDs
+function staffMarkTableSat(resId, role) {
+  if (!['owner', 'manager', 'vip-host'].includes(role)) {
+    showToast('Only owner, manager, or VIP host can seat tables');
+    return;
+  }
+  const res = RESERVATION_QUEUE.find(r => r.id === resId);
+  if (!res) return;
+
+  const tableNum = selectedFloorTable[resId];
+  if (!tableNum) { showToast('Select a table from the floor plan first'); return; }
+
+  const waitressId = document.getElementById(`staff-res-waitress-${resId}`)?.value;
+  if (!waitressId) { showToast('Assign a waitress before marking as sat'); return; }
+
+  const alreadySat = RESERVATION_QUEUE.find(r =>
+    r.id !== resId && r.status === 'sat' &&
+    r.tableAssigned && r.tableAssigned.toString() === tableNum.toString()
+  );
+  if (alreadySat) { showToast(`Table ${tableNum} is already sat — pick another`); return; }
+
+  res.waitressAssigned = waitressId;
+  res.tableAssigned    = tableNum.toString();
+  res.status           = 'sat';
+
+  const waitress = STAFF_LIST.find(s => s.id === waitressId);
+  const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+  const promoterEntry = SALES_LOG.find(s => s.memberId === res.memberId && s.type === 'table');
+  logSaleAndFireThread({
+    id: res.id, type: 'table',
+    memberId: res.memberId, memberName: res.memberName, memberPhone: res.memberPhone,
+    promoterId:    promoterEntry?.promoterId || res.referredByPromoter || null,
+    promoterName:  promoterEntry?.promoterName || null,
+    eventName:     res.eventName || 'tonight',
+    dateKey:       res.dateKey,
+    tableAssigned: res.tableAssigned,
+    waitressName:  waitress?.name || null,
+    partySize:     res.partySize,
+    amount:        promoterEntry?.amount || 0,
+    isComp:        promoterEntry?.isComp || false,
+  });
+
+  // Transition thread RESERVATION → FLOOR
+  const sThread = SMS_THREADS.find(t => t.memberId === res.memberId && t.type === 'RESERVATION');
+  if (sThread && waitress) {
+    sThread.type         = 'FLOOR';
+    sThread.tag          = 'FLOOR';
+    sThread.threadName   = `${sanitizeHTML(res.memberName)} — Table ${res.tableAssigned}`;
+    sThread.tableNum     = res.tableAssigned;
+    sThread.waitressId   = waitress.id;
+    sThread.waitressName = waitress.name;
+    sThread.recipientRoles = ['owner', 'barback'];
+    sThread.messages.push({
+      from: 'internal',
+      text: `🪑 Table ${res.tableAssigned} sat. ${sanitizeHTML(waitress.name)} assigned as server. Barbacks notified.`,
+      time
+    });
+  }
+
+  delete selectedFloorTable[resId];
+
+  const memberObj = members.find(m => m.id === res.memberId) || { id: res.memberId, name: res.memberName };
+  scheduleFollowUp(memberObj, res.eventName);
+
+  // Update calendar entry to SEATED
+  if (VENUE_EVENTS[res.dateKey]) {
+    const calEntry = VENUE_EVENTS[res.dateKey].find(e => e.resId === resId);
+    if (calEntry) { calEntry.status = 'sat'; calEntry.time = `Table ${res.tableAssigned}`; }
+  }
+
+  showToast(`Table ${res.tableAssigned} sat — ${waitress?.name || 'server'} in thread`);
+
+  // Also refresh owner reservation list if visible
+  if (document.getElementById('owner-reservations-list')) renderOwnerReservations();
+
+  // Refresh staff panel
+  _refreshStaffReservations(role);
+}
+
 // ─── Reservation System ────────────────────────────────────
+// ─── Walk-In Seating (Owner / Manager / VIP Host) ────────
+let _walkInPendingData = null; // { name, phone, context: 'owner'|'staff', role }
+
+function showWalkInModal(context, role) {
+  const existing = document.getElementById('walkin-modal');
+  if (existing) existing.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'walkin-modal';
+  modal.className = 'security-modal';
+  modal.style.cssText = 'display:flex;z-index:10002';
+  modal.innerHTML = `
+    <div class="security-modal-card" style="max-width:440px">
+      <div class="security-title" style="font-size:18px;margin-bottom:4px">Seat Walk-In</div>
+      <div class="security-sub" style="margin-bottom:20px">Search for an existing member or create a new one to seat.</div>
+      <div class="form-group">
+        <label class="form-label">Search Member</label>
+        <div style="position:relative">
+          <input class="form-input" id="walkin-search" placeholder="Name or phone..." autocomplete="off"
+            oninput="onWalkInSearchInput(this.value,'${context}','${role || ''}')">
+          <div id="walkin-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg2);border:1px solid var(--accent);border-radius:0 0 10px 10px;z-index:200;max-height:180px;overflow-y:auto"></div>
+        </div>
+      </div>
+      <div id="walkin-selected-member" style="display:none;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:6px"></div>
+
+      <div id="walkin-new-member-section" style="display:none">
+        <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin:12px 0 8px">CREATE NEW MEMBER</div>
+        <div class="form-group">
+          <label class="form-label">Full Name <span style="color:var(--error)">*</span></label>
+          <input class="form-input" id="walkin-new-name" placeholder="First and last name" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Phone <span style="color:var(--error)">*</span></label>
+          <input class="form-input" id="walkin-new-phone" type="tel" placeholder="+1 (305) 555-0000" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Email <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+          <input class="form-input" id="walkin-new-email" type="email" placeholder="email@example.com" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Date of Birth <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+          <input class="form-input" id="walkin-new-dob" type="date" style="font-family:'Space Mono',monospace;font-size:13px">
+        </div>
+      </div>
+
+      <div style="display:flex;gap:10px;margin-top:12px" id="walkin-action-row">
+        <button class="btn-ghost" id="walkin-new-toggle" onclick="toggleWalkInNewMember()">+ New Member</button>
+        <button class="btn-gold" id="walkin-proceed-btn" onclick="proceedWalkIn('${context}','${role || ''}')">Next: Assign Table →</button>
+        <button class="btn-ghost" onclick="document.getElementById('walkin-modal').remove()">Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+let _walkInSelectedMember = null;
+let _walkInNewMemberMode  = false;
+
+function onWalkInSearchInput(val, context, role) {
+  _walkInSelectedMember = null;
+  const dd = document.getElementById('walkin-dropdown');
+  const sel = document.getElementById('walkin-selected-member');
+  if (sel) sel.style.display = 'none';
+  if (!val || val.length < 2) { if (dd) dd.style.display = 'none'; return; }
+
+  const q = val.toLowerCase();
+  const matches = members.filter(m =>
+    m.name.toLowerCase().includes(q) || m.phone.includes(q)
+  ).slice(0, 6);
+
+  if (!dd) return;
+  if (!matches.length) { dd.style.display = 'none'; return; }
+  dd.style.display = 'block';
+  dd.innerHTML = matches.map(m => `
+    <div onclick="selectWalkInMember('${m.id}')"
+      style="padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-family:'Space Mono',monospace"
+      onmouseover="this.style.background='var(--bg)'" onmouseout="this.style.background=''">
+      <div style="font-size:12px;color:var(--text)">${sanitizeHTML(m.name)}</div>
+      <div style="font-size:10px;color:var(--muted);margin-top:2px">${sanitizeHTML(m.phone)}</div>
+    </div>`).join('');
+}
+
+function selectWalkInMember(memberId) {
+  const m = members.find(m => m.id === memberId);
+  if (!m) return;
+  _walkInSelectedMember = m;
+
+  const input = document.getElementById('walkin-search');
+  if (input) input.value = m.name;
+  const dd = document.getElementById('walkin-dropdown');
+  if (dd) dd.style.display = 'none';
+
+  const sel = document.getElementById('walkin-selected-member');
+  if (sel) {
+    sel.style.display = 'block';
+    sel.innerHTML = `<div style="color:var(--accent);font-size:10px;margin-bottom:4px;letter-spacing:0.08em">MEMBER SELECTED</div>
+      <div style="color:var(--text);font-size:12px">${sanitizeHTML(m.name)}</div>
+      <div style="margin-top:2px">${sanitizeHTML(m.phone)} · ${m.points} pts · ${m.visits||0} visits</div>`;
+  }
+
+  // Hide new member form if they pick from search
+  if (_walkInNewMemberMode) toggleWalkInNewMember();
+}
+
+function toggleWalkInNewMember() {
+  _walkInNewMemberMode = !_walkInNewMemberMode;
+  const sec = document.getElementById('walkin-new-member-section');
+  const btn = document.getElementById('walkin-new-toggle');
+  if (sec) sec.style.display = _walkInNewMemberMode ? 'block' : 'none';
+  if (btn) btn.textContent = _walkInNewMemberMode ? '← Back to Search' : '+ New Member';
+  if (_walkInNewMemberMode) _walkInSelectedMember = null;
+}
+
+function proceedWalkIn(context, role) {
+  if (_walkInNewMemberMode) {
+    // Create new member via 2FA first
+    const name  = document.getElementById('walkin-new-name')?.value.trim();
+    const phone = document.getElementById('walkin-new-phone')?.value.trim();
+    const email = document.getElementById('walkin-new-email')?.value.trim();
+    const dob   = document.getElementById('walkin-new-dob')?.value;
+
+    if (!name || name.length < 2)   { showToast('Enter member name'); return; }
+    if (!phone || phone.length < 7)  { showToast('Enter a valid phone'); return; }
+    if (members.some(m => m.phone === phone)) { showToast('Member with this phone already exists'); return; }
+
+    _walkInPendingData = { name, phone, email: email||null, dob: dob||null, context, role };
+    document.getElementById('walkin-modal').remove();
+
+    show2FA(
+      `Sending verification code to ${phone} to confirm this number.`,
+      () => completeWalkInNewMember(),
+      null
+    );
+  } else {
+    if (!_walkInSelectedMember) { showToast('Select a member to continue'); return; }
+    document.getElementById('walkin-modal').remove();
+    openWalkInTableAssign(_walkInSelectedMember, context, role);
+  }
+}
+
+async function completeWalkInNewMember() {
+  const pending = _walkInPendingData;
+  if (!pending) return;
+  _walkInPendingData = null;
+
+  const { name, phone, email, dob, context, role } = pending;
+  const nameParts = name.trim().split(' ');
+  const first = nameParts[0];
+  const last  = nameParts.slice(1).join(' ') || '-';
+
+  let newMember;
+  const client = getDb();
+
+  if (client) {
+    try {
+      const { data: inserted, error } = await client
+        .from('members')
+        .insert([{ first_name: first, last_name: last, phone, email: email||null, date_of_birth: dob||null, total_points: 0, total_visits: 0, status: 'active' }])
+        .select().single();
+      if (error) { showToast('Error creating member'); console.warn(error.message); return; }
+      newMember = normalizeRow(inserted);
+    } catch(e) { showToast('Error creating member'); return; }
+  } else {
+    newMember = {
+      id: 'LOCAL-' + Math.random().toString(36).substr(2,9).toUpperCase(),
+      name, phone, email: email||null, dob: dob||null,
+      joined: new Date().toISOString(), points: 0, visits: 0,
+    };
+  }
+  members.unshift(newMember);
+  showToast(`${name} created — now assign a table`);
+  openWalkInTableAssign(newMember, context, role);
+}
+
+function openWalkInTableAssign(member, context, role) {
+  // Create a synthetic "sat-immediately" reservation and show the floor plan
+  const resId = 'WALK' + Date.now().toString().slice(-5);
+  const today = new Date();
+  const dateKey = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+
+  // Push as confirmed so the floor plan & waitress assign panel appear
+  RESERVATION_QUEUE.push({
+    id: resId,
+    memberName:  member.name,
+    memberId:    member.id,
+    memberPhone: member.phone,
+    dateKey,
+    eventName:   'Walk-In',
+    partySize:   1,
+    occasion:    'Walk-in',
+    notes:       '',
+    referredByPromoter: null,
+    status:      'confirmed',
+    requestedAt: Date.now(),
+    tableAssigned: null,
+    waitressAssigned: null,
+    isWalkIn:    true,
+  });
+
+  showToast(`${member.name} added — assign table below`);
+
+  // Refresh the appropriate reservation panel
+  if (context === 'owner') {
+    renderOwnerReservations();
+    // Scroll to reservation list
+    setTimeout(() => {
+      const el = document.getElementById(`res-card-${resId}`);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 200);
+  } else {
+    _refreshStaffReservations(role);
+    setTimeout(() => {
+      const el = document.getElementById(`staff-res-card-${resId}`);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 200);
+  }
+}
+
 function renderOwnerReservations() {
   const container = document.getElementById('owner-reservations-list');
   if (!container) return;
@@ -3587,8 +4613,10 @@ function renderOwnerReservations() {
   const confirmed = RESERVATION_QUEUE.filter(r => r.status === 'confirmed');
   const sat       = RESERVATION_QUEUE.filter(r => r.status === 'sat');
 
+  const walkInBtn = `<button class="cal-save-btn" style="border-color:var(--accent);color:var(--accent);margin-bottom:16px;width:100%" onclick="showWalkInModal('owner','')">🚶 Seat Walk-In</button>`;
+
   if (!RESERVATION_QUEUE.length) {
-    container.innerHTML = `<div style="padding:16px 0;text-align:center;color:var(--dim);font-family:'Space Mono',monospace;font-size:10px">No reservation requests</div>`;
+    container.innerHTML = walkInBtn + `<div style="padding:16px 0;text-align:center;color:var(--dim);font-family:'Space Mono',monospace;font-size:10px">No reservation requests</div>`;
     return;
   }
 
@@ -3651,7 +4679,7 @@ function renderOwnerReservations() {
     </div>`;
   };
 
-  let html = floorOverview;
+  let html = walkInBtn + floorOverview;
   if (pending.length)   html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--acid);letter-spacing:0.08em;margin-bottom:8px">PENDING (${pending.length})</div>` + pending.map(renderRes).join('');
   if (confirmed.length) html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#60A5FA;letter-spacing:0.08em;margin:16px 0 8px">CONFIRMED — AWAITING SEAT (${confirmed.length})</div>` + confirmed.map(renderRes).join('');
   if (sat.length)       html += `<div style="font-family:'Space Mono',monospace;font-size:9px;color:#34D399;letter-spacing:0.08em;margin:16px 0 8px">SEATED (${sat.length})</div>` + sat.map(renderRes).join('');
@@ -3663,6 +4691,25 @@ function acceptReservation(resId) {
   if (!res) return;
   res.tableAssigned = document.getElementById(`res-table-${resId}`)?.value?.trim() || null;
   res.status = 'confirmed';
+
+  // Write to VENUE_EVENTS so it appears on owner/manager/vip-host calendar
+  if (!VENUE_EVENTS[res.dateKey]) VENUE_EVENTS[res.dateKey] = [];
+  // Remove any existing calendar entry for this reservation (avoid duplicates on re-accept)
+  const existingCalIdx = VENUE_EVENTS[res.dateKey].findIndex(e => e.resId === resId);
+  if (existingCalIdx >= 0) VENUE_EVENTS[res.dateKey].splice(existingCalIdx, 1);
+  VENUE_EVENTS[res.dateKey].push({
+    name:    res.memberName,
+    host:    '',
+    type:    'reservation',
+    tag:     'RESERVATION',
+    rawTime: '',
+    time:    res.tableAssigned ? `Table ${res.tableAssigned}` : 'Awaiting table',
+    desc:    `${res.partySize} guests · ${res.occasion}${res.notes ? ' · "' + res.notes + '"' : ''}`,
+    resId:   resId,
+    status:  'confirmed',
+    private: true,   // never shown to members
+    saveDate: false,
+  });
 
   // Notify the member via concierge thread
   if (res.memberId) {
@@ -3775,6 +4822,12 @@ function markTableSat(resId) {
   const memberObj = members.find(m => m.id === res.memberId) || { id: res.memberId, name: res.memberName };
   scheduleFollowUp(memberObj, res.eventName);
 
+  // Update calendar entry to SEATED
+  if (VENUE_EVENTS[res.dateKey]) {
+    const calEntry = VENUE_EVENTS[res.dateKey].find(e => e.resId === resId);
+    if (calEntry) { calEntry.status = 'sat'; calEntry.time = `Table ${res.tableAssigned}`; }
+  }
+
   // Clear the floor plan selection for this res
   delete selectedFloorTable[resId];
 
@@ -3783,6 +4836,11 @@ function markTableSat(resId) {
 }
 
 function declineReservation(resId) {
+  const res = RESERVATION_QUEUE.find(r => r.id === resId);
+  if (res && VENUE_EVENTS[res.dateKey]) {
+    const calIdx = VENUE_EVENTS[res.dateKey].findIndex(e => e.resId === resId);
+    if (calIdx >= 0) VENUE_EVENTS[res.dateKey].splice(calIdx, 1);
+  }
   const idx = RESERVATION_QUEUE.findIndex(r => r.id === resId);
   if (idx >= 0) { RESERVATION_QUEUE.splice(idx, 1); showToast('Reservation declined'); renderOwnerReservations(); }
 }
@@ -3811,6 +4869,56 @@ function savePrice(priceId) {
   showToast(`${item.label} set to $${val}`);
 }
 
+// ─── Comp live member search ──────────────────────────────
+let _compSelectedMember = null;
+
+function onCompRecipientInput(val) {
+  _compSelectedMember = null;
+  const confirm = document.getElementById('comp-member-confirm');
+  const dd = document.getElementById('comp-member-dropdown');
+  if (confirm) confirm.style.display = 'none';
+  if (!val || val.length < 2) { if (dd) dd.style.display = 'none'; return; }
+
+  const q = val.toLowerCase();
+  const matches = members.filter(m =>
+    m.name.toLowerCase().includes(q) || m.phone.includes(q)
+  ).slice(0, 6);
+
+  if (!dd) return;
+  if (!matches.length) { dd.style.display = 'none'; return; }
+
+  dd.style.display = 'block';
+  dd.innerHTML = matches.map(m => `
+    <div onclick="selectCompMember('${m.id}')"
+      style="padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-family:'Space Mono',monospace"
+      onmouseover="this.style.background='var(--bg)'" onmouseout="this.style.background=''">
+      <div style="font-size:12px;color:var(--text)">${sanitizeHTML(m.name)}</div>
+      <div style="font-size:10px;color:var(--muted);margin-top:2px">${sanitizeHTML(m.phone)}${m.email ? ' · ' + sanitizeHTML(m.email) : ''}</div>
+    </div>`).join('');
+}
+
+function selectCompMember(memberId) {
+  const m = members.find(m => m.id === memberId);
+  if (!m) return;
+  _compSelectedMember = m;
+
+  const input = document.getElementById('comp-recipient');
+  if (input) input.value = m.name;
+
+  const dd = document.getElementById('comp-member-dropdown');
+  if (dd) dd.style.display = 'none';
+
+  const confirm = document.getElementById('comp-member-confirm');
+  if (confirm) {
+    confirm.style.display = 'block';
+    confirm.innerHTML = `
+      <div style="color:var(--accent);font-size:10px;margin-bottom:6px;letter-spacing:0.08em">MEMBER FOUND</div>
+      <div style="color:var(--text);font-size:12px">${sanitizeHTML(m.name)}</div>
+      <div style="margin-top:3px">${sanitizeHTML(m.phone)}${m.email ? ' · ' + sanitizeHTML(m.email) : ''}</div>
+      <div style="margin-top:3px">ID: ${sanitizeHTML(m.id.split('-')[0].toUpperCase())} · ${m.points} pts · ${m.visits || 0} visits</div>`;
+  }
+}
+
 function renderOwnerComps() {
   const container = document.getElementById('owner-comps-list');
   if (!container) return;
@@ -3837,15 +4945,23 @@ function issueComp() {
   const typeLabels = { 'ticket': 'GA Ticket', 'vip-ticket': 'VIP Ticket', 'table': 'Table Reservation' };
   const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
 
-  // Find member by name or phone
-  const member = members.find(m => m.name === recipient || m.phone === recipient);
+  // Use the live-search selected member, or fall back to name/phone lookup
+  const member = _compSelectedMember || members.find(m => m.name === recipient || m.phone === recipient);
   const saleId = 'COMP' + Date.now().toString().slice(-5);
 
   // Log comp
-  COMPS_ISSUED.push({ type: typeLabels[type] || type, recipient, note, time, issuedBy: 'owner' });
+  COMPS_ISSUED.push({ type: typeLabels[type] || type, recipient: member ? member.name : recipient, note, time, issuedBy: 'owner' });
+
+  // Clear the form and search state
   document.getElementById('comp-recipient').value = '';
   document.getElementById('comp-note').value = '';
-  showToast(`Comp issued to ${recipient}`);
+  const dd = document.getElementById('comp-member-dropdown');
+  const confirm = document.getElementById('comp-member-confirm');
+  if (dd) dd.style.display = 'none';
+  if (confirm) confirm.style.display = 'none';
+  _compSelectedMember = null;
+
+  showToast(`Comp issued to ${member ? member.name : recipient}`);
   renderOwnerComps();
 
   // If we have a member record, fire the pipeline
@@ -3874,6 +4990,14 @@ function issueComp() {
 }
 
 // ─── Owner Staff — separated by role type ─────────────────
+// Track which staff sections are open (collapsed by default)
+const _staffSectionOpen = {};
+
+function toggleStaffSection(sectionId) {
+  _staffSectionOpen[sectionId] = !_staffSectionOpen[sectionId];
+  renderOwnerStaff();
+}
+
 function renderOwnerStaff() {
   const floorRoles = ['bartender','waitress','host','vip-host','doorman','barback','manager'];
   const floorActive   = STAFF_LIST.filter(s => floorRoles.includes(s.role) && s.active);
@@ -3881,51 +5005,142 @@ function renderOwnerStaff() {
   const promoActive   = PROMOTER_LIST.filter(p => p.active);
   const promoInactive = PROMOTER_LIST.filter(p => !p.active);
 
-  const renderFloor = (list, inactive) => list.map(s => `
-    <div class="employee-row">
-      <div>
-        <span class="role-badge ${s.role}">${(ROLE_LABELS[s.role]||s.role).toUpperCase()}</span>
-        <span style="font-size:14px;color:var(--text);margin-left:10px">${sanitizeHTML(s.name)}</span>
-        ${s.section ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:3px">📍 ${s.section}</div>` : ''}
+  const makeSection = (id, label, countBadge, contentHtml) => {
+    const isOpen = !!_staffSectionOpen[id];
+    return `
+    <div style="border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:10px">
+      <div onclick="toggleStaffSection('${id}')" style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:var(--bg2);cursor:pointer;user-select:none">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--text);letter-spacing:0.04em">${label}</span>
+          <span style="font-family:'Space Mono',monospace;font-size:9px;padding:1px 7px;border-radius:10px;background:var(--accent)18;color:var(--accent);border:1px solid var(--accent)30">${countBadge}</span>
+        </div>
+        <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">${isOpen ? '▲' : '▼'}</span>
       </div>
-      <div style="display:flex;gap:8px">
-        ${inactive
-          ? `<button class="cal-save-btn" onclick="toggleStaffActive('${s.id}',true)">Reactivate</button>`
-          : `<button class="cal-save-btn" onclick="toggleStaffActive('${s.id}',false)">Day Off</button>`}
-        <button class="cal-save-btn" style="border-color:var(--error);color:var(--error)" onclick="archiveStaff('${s.id}')">Archive</button>
+      <div style="display:${isOpen ? 'block' : 'none'};padding:${isOpen ? '12px 14px' : '0'}">
+        ${contentHtml}
       </div>
-    </div>`).join('') || `<div style="color:var(--dim);font-family:'Space Mono',monospace;font-size:10px;padding:10px 0">None</div>`;
+    </div>`;
+  };
 
-  const renderPromo = (list, inactive) => list.map(p => `
-    <div class="employee-row">
-      <div>
-        <span class="role-badge promoter">PROMOTER</span>
-        <span style="font-size:14px;color:var(--text);margin-left:10px">${sanitizeHTML(p.name)}</span>
-        <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:3px">${p.guestList.length} on list · ${p.nights.length} night(s)</div>
+  const renderFloorRow = (s, inactive) => {
+    const locked = isAccountLocked(s.phone);
+    const statusDot = s.active
+      ? `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#34D399;margin-right:6px"></span>`
+      : `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#EF4444;margin-right:6px"></span>`;
+    return `
+    <div class="employee-row" style="flex-direction:column;align-items:stretch">
+      <div style="display:flex;align-items:center;justify-content:space-between" onclick="toggleStaffRowDetail('${s.id}')">
+        <div style="display:flex;align-items:center;gap:10px">
+          ${statusDot}
+          <span class="role-badge ${s.role}">${(ROLE_LABELS[s.role]||s.role).toUpperCase()}</span>
+          <span style="font-size:14px;color:var(--text)">${sanitizeHTML(s.name)}</span>
+          ${locked ? '<span style="font-family:Space Mono,monospace;font-size:8px;padding:1px 5px;border-radius:3px;background:rgba(239,68,68,0.12);color:#EF4444;border:1px solid rgba(239,68,68,0.3)">LOCKED</span>' : ''}
+        </div>
+        <span style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)">▼</span>
       </div>
-      <div style="display:flex;gap:8px">
-        ${inactive
-          ? `<button class="cal-save-btn" onclick="togglePromoterActive('${p.id}',true)">Activate</button>`
-          : `<button class="cal-save-btn" onclick="togglePromoterActive('${p.id}',false)">Deactivate</button>`}
+      <div id="staff-row-detail-${s.id}" style="display:none;margin-top:10px;padding:10px;background:var(--bg);border-radius:8px;border:1px solid var(--border)">
+        <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:6px">
+          ${s.phone ? 'Phone: ' + sanitizeHTML(s.phone) : 'No phone'} · Status: <span style="color:${s.active ? '#34D399' : '#EF4444'}">${s.active ? 'ACTIVE' : 'INACTIVE'}</span>
+          ${s.section ? ' · Section: ' + s.section : ''}
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px">
+          ${inactive
+            ? `<button class="cal-save-btn" onclick="toggleStaffActive('${s.id}',true);renderOwnerStaff()">Reactivate</button>`
+            : `<button class="cal-save-btn" onclick="toggleStaffActive('${s.id}',false);renderOwnerStaff()">Mark Day Off</button>`}
+          <button class="cal-save-btn" style="border-color:var(--error);color:var(--error)" onclick="archiveStaff('${s.id}')">Archive</button>
+          ${locked ? `<button onclick="ownerUnlockAccount('${s.phone}','${s.name.replace(/'/g, "\\'")}');renderOwnerStaff()" style="font-family:'Space Mono',monospace;font-size:9px;padding:4px 10px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.4);border-radius:6px;color:#EF4444;cursor:pointer">Unlock Account</button>` : ''}
+        </div>
       </div>
-    </div>`).join('') || `<div style="color:var(--dim);font-family:'Space Mono',monospace;font-size:10px;padding:10px 0">None</div>`;
+    </div>`;
+  };
 
-  const fa  = document.getElementById('owner-staff-floor-active');
-  const fi  = document.getElementById('owner-staff-floor-inactive');
-  const pa  = document.getElementById('owner-staff-promoters-active');
-  const pi  = document.getElementById('owner-staff-promoters-inactive');
-  const sec = document.getElementById('owner-section-assignments');
+  const renderPromoRow = (p, inactive) => {
+    const statusDot = p.active
+      ? `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#34D399;margin-right:6px"></span>`
+      : `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#EF4444;margin-right:6px"></span>`;
+    return `
+    <div class="employee-row" style="flex-direction:column;align-items:stretch">
+      <div style="display:flex;align-items:center;justify-content:space-between" onclick="togglePromoRowDetail('${p.id}')">
+        <div style="display:flex;align-items:center;gap:10px">
+          ${statusDot}
+          <span class="role-badge promoter">PROMOTER</span>
+          <span style="font-size:14px;color:var(--text)">${sanitizeHTML(p.name)}</span>
+        </div>
+        <span style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)">▼</span>
+      </div>
+      <div id="promo-row-detail-${p.id}" style="display:none;margin-top:10px;padding:10px;background:var(--bg);border-radius:8px;border:1px solid var(--border)">
+        <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:6px">
+          Status: <span style="color:${p.active ? '#34D399' : '#EF4444'}">${p.active ? 'ACTIVE' : 'INACTIVE'}</span>
+          · ${p.guestList.length} on list · ${p.nights.length} night(s)
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px">
+          ${inactive
+            ? `<button class="cal-save-btn" onclick="togglePromoterActive('${p.id}',true)">Activate</button>`
+            : `<button class="cal-save-btn" onclick="togglePromoterActive('${p.id}',false)">Deactivate</button>`}
+        </div>
+      </div>
+    </div>`;
+  };
 
-  if (fa)  fa.innerHTML  = renderFloor(floorActive, false);
-  if (fi)  fi.innerHTML  = renderFloor(floorInactive, true);
-  if (pa)  pa.innerHTML  = renderPromo(promoActive, false);
-  if (pi)  pi.innerHTML  = renderPromo(promoInactive, true);
-  if (sec) {
-    const assigned = STAFF_LIST.filter(s => s.section && s.active);
-    sec.innerHTML = assigned.length
-      ? assigned.map(s => `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-family:'Space Mono',monospace;font-size:11px"><span style="color:var(--text)">${sanitizeHTML(s.name)}</span><span style="color:var(--muted)">${s.section}</span></div>`).join('')
-      : `<div style="color:var(--dim);font-family:'Space Mono',monospace;font-size:10px;padding:10px 0">No sections assigned tonight</div>`;
-  }
+  const floorActiveHtml  = floorActive.length   ? floorActive.map(s => renderFloorRow(s, false)).join('') : '<div style="color:var(--dim);font-family:\'Space Mono\',monospace;font-size:10px;padding:10px 0">None</div>';
+  const floorInactiveHtml= floorInactive.length  ? floorInactive.map(s => renderFloorRow(s, true)).join('') : '<div style="color:var(--dim);font-family:\'Space Mono\',monospace;font-size:10px;padding:10px 0">None</div>';
+  const promoActiveHtml  = promoActive.length    ? promoActive.map(p => renderPromoRow(p, false)).join('') : '<div style="color:var(--dim);font-family:\'Space Mono\',monospace;font-size:10px;padding:10px 0">None</div>';
+  const promoInactiveHtml= promoInactive.length  ? promoInactive.map(p => renderPromoRow(p, true)).join('') : '<div style="color:var(--dim);font-family:\'Space Mono\',monospace;font-size:10px;padding:10px 0">None</div>';
+
+  const assigned = STAFF_LIST.filter(s => s.section && s.active);
+  const sectionsHtml = assigned.length
+    ? assigned.map(s => `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-family:'Space Mono',monospace;font-size:11px"><span style="color:var(--text)">${sanitizeHTML(s.name)}</span><span style="color:var(--muted)">${s.section}</span></div>`).join('')
+    : '<div style="color:var(--dim);font-family:\'Space Mono\',monospace;font-size:10px;padding:10px 0">No sections assigned tonight</div>';
+
+  const staffTab = document.getElementById('owner-tab-staff');
+  if (!staffTab) return;
+
+  // Find add staff section to preserve it
+  const addStaffSection = staffTab.querySelector('#staff-add-section');
+  const addStaffHtml = addStaffSection ? addStaffSection.outerHTML : '';
+
+  staffTab.innerHTML =
+    makeSection('floor-active',   'Floor Staff — Active',          floorActive.length,    floorActiveHtml) +
+    makeSection('floor-inactive',  'Floor Staff — Day Off / Inactive', floorInactive.length, floorInactiveHtml) +
+    makeSection('promo-active',    'Promoters — Active',            promoActive.length,    promoActiveHtml) +
+    makeSection('promo-inactive',  'Promoters — Inactive',          promoInactive.length,  promoInactiveHtml) +
+    makeSection('sections',        'Section Assignments Tonight',   assigned.length,       sectionsHtml) +
+    `<div id="staff-add-section" style="border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:10px">
+      <div onclick="toggleStaffSection('add-form')" style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:var(--bg2);cursor:pointer;user-select:none">
+        <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--text);letter-spacing:0.04em">Add Staff / Promoter</span>
+        <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">${_staffSectionOpen['add-form'] ? '▲' : '▼'}</span>
+      </div>
+      <div style="display:${_staffSectionOpen['add-form'] ? 'block' : 'none'};padding:14px">
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <input class="form-input" id="new-staff-name" placeholder="Full name">
+          <select class="form-input" id="new-staff-role" style="font-family:'Space Mono',monospace;font-size:12px">
+            <option value="">Select role...</option>
+            <option value="bartender">Bartender</option>
+            <option value="waitress">Waitress</option>
+            <option value="host">Host</option>
+            <option value="vip-host">VIP Host</option>
+            <option value="doorman">Doorman</option>
+            <option value="barback">Barback</option>
+            <option value="manager">Manager</option>
+            <option value="promoter">Promoter</option>
+          </select>
+          <input class="form-input" id="new-staff-phone" type="tel" placeholder="Phone number for 2FA (e.g. +13055551234)" style="letter-spacing:0.05em">
+          <button class="btn-gold" onclick="addStaffMember()">Add to Roster</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function toggleStaffRowDetail(staffId) {
+  const el = document.getElementById(`staff-row-detail-${staffId}`);
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+function togglePromoRowDetail(promoId) {
+  const el = document.getElementById(`promo-row-detail-${promoId}`);
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
 }
 
 function togglePromoterActive(id, active) {
@@ -3955,6 +5170,226 @@ function addStaffMember() {
   document.getElementById('new-staff-phone').value = '';
   renderOwnerStaff();
   showToast(`${name} added — 2FA phone set`);
+}
+
+
+// ─── Owner Calendar Subcategories ────────────────────────
+// Each subcategory supports 'date' or 'week' view modes
+const _calSubState = {
+  schedules:     { open: false, mode: 'date' },
+  events:        { open: false, mode: 'date' },
+  tableSales:    { open: false, mode: 'date' },
+  ticketSales:   { open: false, mode: 'date' },
+  reservations:  { open: true,  mode: 'date' },
+};
+
+function toggleCalSub(key) {
+  _calSubState[key].open = !_calSubState[key].open;
+  renderOwnerCalendarSubs();
+}
+
+function setCalSubMode(key, mode) {
+  _calSubState[key].mode = mode;
+  renderOwnerCalendarSubs();
+}
+
+function renderOwnerCalendarSubs() {
+  const container = document.getElementById('owner-cal-subs');
+  if (!container) return;
+
+  const now = new Date();
+  const toKey = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+
+  // Collect all events by type
+  const allEvents = Object.entries(VENUE_EVENTS).flatMap(([dk, evs]) =>
+    evs.map(e => ({ ...e, dateKey: dk }))
+  );
+
+  // Get this week's date keys
+  const weekKeys = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(now); d.setDate(now.getDate() + i - now.getDay());
+    weekKeys.push(toKey(d));
+  }
+
+  const makeSubSection = (key, label, icon, itemsFn) => {
+    const state = _calSubState[key];
+    const items = itemsFn();
+    const modeBtn = (mode, label) =>
+      `<button onclick="setCalSubMode('${key}','${mode}');event.stopPropagation()"
+        style="font-family:'Space Mono',monospace;font-size:8px;padding:3px 8px;border-radius:4px;cursor:pointer;
+        background:${state.mode===mode ? 'var(--accent)' : 'transparent'};
+        color:${state.mode===mode ? '#080808' : 'var(--muted)'};
+        border:1px solid ${state.mode===mode ? 'var(--accent)' : 'var(--border)'}">
+        ${label}
+      </button>`;
+
+    const displayItems = state.mode === 'week'
+      ? items.filter(i => weekKeys.includes(i.dateKey))
+      : items.filter(i => i.dateKey === toKey(now));
+
+    const emptyMsg = state.mode === 'week' ? 'Nothing this week' : 'Nothing scheduled today';
+
+    return `
+    <div style="border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:10px">
+      <div onclick="toggleCalSub('${key}')" style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:var(--bg2);cursor:pointer;user-select:none">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:14px">${icon}</span>
+          <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--text)">${label}</span>
+          <span style="font-family:'Space Mono',monospace;font-size:9px;padding:1px 7px;border-radius:10px;background:var(--accent)18;color:var(--accent);border:1px solid var(--accent)30">${items.length}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          ${state.open ? `<div onclick="event.stopPropagation()" style="display:flex;gap:4px">${modeBtn('date','Today')}${modeBtn('week','This Week')}</div>` : ''}
+          <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">${state.open ? '▲' : '▼'}</span>
+        </div>
+      </div>
+      ${state.open ? `
+      <div style="padding:12px 14px">
+        ${displayItems.length ? displayItems.map(item => `
+          <div style="padding:10px 0;border-bottom:1px solid var(--border)">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start">
+              <div>
+                <div style="font-size:13px;color:var(--text)">${sanitizeHTML(item.name || item.memberName || '—')}</div>
+                <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:3px">${item.dateKey} ${item.time ? '· ' + item.time : ''}</div>
+                ${item.desc ? `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:2px">${sanitizeHTML(item.desc)}</div>` : ''}
+              </div>
+              ${item.amount != null ? `<div style="font-family:'Space Mono',monospace;font-size:11px;color:${item.isComp ? '#34D399' : 'var(--accent)'}">${item.isComp ? 'COMP' : '$' + item.amount}</div>` : ''}
+            </div>
+          </div>`).join('') : `<div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--dim);padding:12px 0">${emptyMsg}</div>`}
+      </div>` : ''}
+    </div>`;
+  };
+
+  container.innerHTML =
+    makeSubSection('schedules', 'Schedules', '📅', () =>
+      SCHEDULE.map(s => {
+        const staff = STAFF_LIST.find(x => x.id === s.staffId);
+        return { dateKey: s.dateKey, name: staff?.name || 'Staff', time: `${s.startTime}–${s.endTime}`, desc: ROLE_LABELS[staff?.role] || staff?.role || '' };
+      })
+    ) +
+    makeSubSection('events', 'Events', '🎵', () =>
+      allEvents.filter(e => e.type === 'event' || e.type === 'special')
+        .map(e => ({ dateKey: e.dateKey, name: e.name, time: e.time, desc: e.desc }))
+    ) +
+    makeSubSection('tableSales', 'Table Sales', '🪑', () =>
+      SALES_LOG.filter(s => s.type === 'table')
+        .map(s => ({ dateKey: s.dateKey, name: s.memberName, time: null, desc: `${s.partySize} guests · ${s.eventName}`, amount: s.amount, isComp: s.isComp }))
+    ) +
+    makeSubSection('ticketSales', 'Ticket Sales', '🎟️', () =>
+      SALES_LOG.filter(s => s.type === 'ticket')
+        .map(s => ({ dateKey: s.dateKey, name: s.memberName, time: null, desc: s.eventName, amount: s.amount, isComp: s.isComp }))
+    ) +
+    makeSubSection('reservations', 'Reservation Requests', '📋', () =>
+      RESERVATION_QUEUE.filter(r => r.status === 'pending')
+        .map(r => ({ dateKey: r.dateKey || toKey(now), name: r.memberName, time: null, desc: `${r.partySize} guests · ${r.occasion}`, memberName: r.memberName }))
+    );
+}
+
+// ─── Owner Schedule — Monthly Calendar View ───────────────
+let _ownerSchedDate = new Date();
+
+function initOwnerScheduleCalendar() {
+  _ownerSchedDate = new Date();
+  renderOwnerScheduleCalendar();
+}
+
+function ownerSchedCalNav(dir) {
+  _ownerSchedDate = new Date(_ownerSchedDate.getFullYear(), _ownerSchedDate.getMonth() + dir, 1);
+  renderOwnerScheduleCalendar();
+  document.getElementById('owner-sched-selected-view')?.replaceChildren();
+}
+
+function renderOwnerScheduleCalendar() {
+  const container = document.getElementById('owner-sched-cal-grid');
+  const label = document.getElementById('owner-sched-cal-label');
+  if (!container || !label) return;
+
+  const y = _ownerSchedDate.getFullYear(), m = _ownerSchedDate.getMonth();
+  label.textContent = `${MONTH_NAMES[m].toUpperCase()} ${y}`;
+  const firstDay = new Date(y, m, 1).getDay();
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  const today = new Date();
+  const toKey = (d) => `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+
+  let html = '';
+  for (let i = 0; i < firstDay; i++) html += `<div class="cal-day-cell other-month"></div>`;
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dk = toKey(d);
+    const dayShifts = SCHEDULE.filter(s => s.dateKey === dk);
+    const isToday = today.getFullYear()===y && today.getMonth()===m && today.getDate()===d;
+    const dot = dayShifts.length ? `<div class="event-dot" style="background:#60A5FA"></div>` : '';
+    html += `<div class="cal-day-cell${isToday ? ' today' : ''}" onclick="showOwnerSchedDay('${dk}',${d})" style="cursor:pointer">
+      ${d}${dot}
+    </div>`;
+  }
+
+  container.innerHTML = html;
+  // Show current week breakdown below calendar by default
+  renderOwnerSchedWeekBreakdown();
+}
+
+function showOwnerSchedDay(dateKey, day) {
+  const y = _ownerSchedDate.getFullYear(), m = _ownerSchedDate.getMonth();
+  const dayShifts = SCHEDULE.filter(s => s.dateKey === dateKey);
+  const weekday = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][new Date(y, m, day).getDay()];
+  const container = document.getElementById('owner-sched-selected-view');
+  if (!container) return;
+
+  document.querySelectorAll('#owner-sched-cal-grid .cal-day-cell').forEach(c => c.classList.remove('selected'));
+  const cells = document.querySelectorAll('#owner-sched-cal-grid .cal-day-cell:not(.other-month)');
+  if (cells[day-1]) cells[day-1].classList.add('selected');
+
+  if (!dayShifts.length) {
+    container.innerHTML = `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:8px">${weekday.toUpperCase()}, ${MONTH_NAMES[m].toUpperCase()} ${day}</div>
+      <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--dim);padding:10px 0">No shifts scheduled</div>`;
+    return;
+  }
+
+  container.innerHTML = `
+    <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:10px">${weekday.toUpperCase()}, ${MONTH_NAMES[m].toUpperCase()} ${day}</div>
+    ${dayShifts.map(sh => {
+      const staff = STAFF_LIST.find(s => s.id === sh.staffId);
+      return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:var(--bg2);border-radius:8px;margin-bottom:4px;border-left:3px solid var(--accent)">
+        <div>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
+            <span class="role-badge ${staff?.role||''}">${(ROLE_LABELS[staff?.role]||staff?.role||'').toUpperCase()}</span>
+            <span style="font-size:13px;color:var(--text)">${staff?.name || 'Unknown'}</span>
+          </div>
+          <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">${sh.startTime} – ${sh.endTime}${sh.note ? ' · ' + sh.note : ''}</div>
+        </div>
+        <button onclick="removeShift('${sh.id}','owner')" style="background:transparent;border:1px solid var(--error);border-radius:6px;color:var(--error);cursor:pointer;font-family:'Space Mono',monospace;font-size:9px;padding:4px 8px">Remove</button>
+      </div>`;
+    }).join('')}`;
+}
+
+function renderOwnerSchedWeekBreakdown() {
+  const container = document.getElementById('owner-sched-selected-view');
+  if (!container) return;
+  const now = new Date();
+  // Show next 7 days as default overview
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(now); d.setDate(now.getDate() + i);
+    days.push(d);
+  }
+  const toKey = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  let html = `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:0.08em;margin-bottom:10px">NEXT 7 DAYS</div>`;
+  days.forEach((d, i) => {
+    const key = toKey(d);
+    const dayShifts = SCHEDULE.filter(s => s.dateKey === key);
+    const label = i === 0 ? 'TODAY' : d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).toUpperCase();
+    html += `<div style="margin-bottom:12px">
+      <div style="font-family:'Space Mono',monospace;font-size:9px;color:${i===0?'var(--accent)':'var(--muted)'};letter-spacing:0.05em;margin-bottom:4px">${label}</div>
+      ${dayShifts.length ? dayShifts.map(sh => {
+        const staff = STAFF_LIST.find(s => s.id === sh.staffId);
+        return `<div style="display:flex;justify-content:space-between;padding:8px 10px;background:var(--bg2);border-radius:6px;margin-bottom:3px;border-left:2px solid var(--accent)">
+          <span style="font-size:12px;color:var(--text)">${staff?.name||'?'}</span>
+          <span style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)">${sh.startTime}–${sh.endTime}</span>
+        </div>`;
+      }).join('') : `<div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--dim);padding:4px 0">No shifts</div>`}
+    </div>`;
+  });
+  container.innerHTML = html;
 }
 
 function renderOwnerSalesLog() {
