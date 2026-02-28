@@ -1,6 +1,7 @@
 /* ─────────────────────────────────────────────────────────
-   RIDDIM Members Club — app.js
+   RIDDIM Members Club — app.js  [UI34]
    All application logic. Requires Supabase, QRCode, jsQR CDNs.
+   UI34: Supabase wiring — reservations, staff, shifts, sms_threads, event_types, audit_log
 ───────────────────────────────────────────────────────── */
 
 // ─── Supabase Init ────────────────────────────────────────
@@ -16,6 +17,364 @@ function getDb() {
     }
   } catch(e) { console.warn('Supabase init failed:', e); }
   return db;
+}
+
+// ─── Supabase Table Helpers ───────────────────────────────
+
+/** Load all staff from Supabase into STAFF_LIST and PROMOTER_LIST */
+async function loadStaff() {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { data, error } = await client
+      .from('staff')
+      .select('id, name, phone, role, active, section')
+      .order('name', { ascending: true });
+    if (error) { console.error('loadStaff error:', error.message); return; }
+    STAFF_LIST    = (data || []).filter(s => s.role !== 'promoter').map(s => ({
+      id: s.id, name: s.name, phone: s.phone || '', role: s.role,
+      active: s.active !== false, section: s.section || null,
+    }));
+    PROMOTER_LIST = (data || []).filter(s => s.role === 'promoter').map(s => ({
+      id: s.id, name: s.name, phone: s.phone || '',
+      active: s.active !== false, guestList: [], nights: [],
+    }));
+  } catch(e) { console.error('loadStaff exception:', e); }
+}
+
+/** Write a new staff/promoter row to Supabase */
+async function saveStaffToDb(staffObj) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { error } = await client.from('staff').insert([{
+      id:      staffObj.id,
+      name:    staffObj.name,
+      phone:   staffObj.phone,
+      role:    staffObj.role,
+      active:  staffObj.active,
+      section: staffObj.section || null,
+    }]);
+    if (error) console.error('saveStaffToDb error:', error.message);
+  } catch(e) { console.error('saveStaffToDb exception:', e); }
+}
+
+/** Update a staff row in Supabase */
+async function updateStaffInDb(id, fields) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { error } = await client.from('staff').update(fields).eq('id', id);
+    if (error) console.error('updateStaffInDb error:', error.message);
+  } catch(e) { console.error('updateStaffInDb exception:', e); }
+}
+
+/** Delete a staff row from Supabase */
+async function deleteStaffFromDb(id) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { error } = await client.from('staff').delete().eq('id', id);
+    if (error) console.error('deleteStaffFromDb error:', error.message);
+  } catch(e) { console.error('deleteStaffFromDb exception:', e); }
+}
+
+/** Load all reservations from Supabase into RESERVATION_QUEUE */
+async function loadReservations() {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { data, error } = await client
+      .from('reservations')
+      .select('*')
+      .not('status', 'eq', 'declined')
+      .order('requested_at', { ascending: false });
+    if (error) { console.error('loadReservations error:', error.message); return; }
+    RESERVATION_QUEUE = (data || []).map(r => ({
+      id:                 r.id,
+      memberName:         r.member_name  || 'Guest',
+      memberId:           r.member_id    || null,
+      memberPhone:        r.member_phone || null,
+      dateKey:            r.date_key     || '',
+      eventName:          r.event_name   || '',
+      partySize:          r.party_size   || 1,
+      occasion:           r.occasion     || 'General visit',
+      notes:              r.special_requests || '',
+      referredByPromoter: r.referred_by_promoter || null,
+      status:             r.status       || 'pending',
+      requestedAt:        r.requested_at ? new Date(r.requested_at).getTime() : Date.now(),
+      tableAssigned:      r.table_assigned   || null,
+      waitressAssigned:   r.waitress_assigned || null,
+    }));
+  } catch(e) { console.error('loadReservations exception:', e); }
+}
+
+/** Write a new reservation row to Supabase */
+async function saveReservationToDb(res) {
+  try {
+    const client = getDb();
+    if (!client) return null;
+    const { data, error } = await client.from('reservations').insert([{
+      id:                   res.id,
+      member_id:            res.memberId   || null,
+      member_name:          res.memberName,
+      member_phone:         res.memberPhone || null,
+      type:                 res.occasion   || 'General visit',
+      event_date:           res.dateKey    || null,
+      date_key:             res.dateKey    || null,
+      event_name:           res.eventName  || null,
+      party_size:           res.partySize  || 1,
+      special_requests:     res.notes      || null,
+      occasion:             res.occasion   || 'General visit',
+      notes:                res.notes      || null,
+      referred_by_promoter: res.referredByPromoter || null,
+      status:               'pending',
+      requested_at:         new Date().toISOString(),
+      table_assigned:       null,
+      waitress_assigned:    null,
+    }]).select().single();
+    if (error) { console.error('saveReservationToDb error:', error.message); return null; }
+    return data;
+  } catch(e) { console.error('saveReservationToDb exception:', e); return null; }
+}
+
+/** Update a reservation's status (and optional fields) in Supabase */
+async function updateReservationInDb(id, fields) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    // Map camelCase → snake_case for DB
+    const dbFields = {};
+    if (fields.status           !== undefined) dbFields.status             = fields.status;
+    if (fields.tableAssigned    !== undefined) dbFields.table_assigned     = fields.tableAssigned;
+    if (fields.waitressAssigned !== undefined) dbFields.waitress_assigned  = fields.waitressAssigned;
+    const { error } = await client.from('reservations').update(dbFields).eq('id', id);
+    if (error) console.error('updateReservationInDb error:', error.message);
+  } catch(e) { console.error('updateReservationInDb exception:', e); }
+}
+
+/** Load all shifts from Supabase into SCHEDULE */
+async function loadShifts() {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { data, error } = await client
+      .from('shifts')
+      .select('*')
+      .order('date_key', { ascending: true });
+    if (error) { console.error('loadShifts error:', error.message); return; }
+    SCHEDULE = (data || []).map(s => ({
+      id:        s.id,
+      staffId:   s.staff_id,
+      dateKey:   s.date_key,
+      startTime: s.start_time,
+      endTime:   s.end_time,
+      role:      s.role  || '',
+      note:      s.note  || '',
+    }));
+  } catch(e) { console.error('loadShifts exception:', e); }
+}
+
+/** Write a new shift row to Supabase */
+async function saveShiftToDb(shift) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { error } = await client.from('shifts').insert([{
+      id:         shift.id,
+      staff_id:   shift.staffId,
+      date_key:   shift.dateKey,
+      start_time: shift.startTime,
+      end_time:   shift.endTime,
+      role:       shift.role  || '',
+      note:       shift.note  || '',
+    }]);
+    if (error) console.error('saveShiftToDb error:', error.message);
+  } catch(e) { console.error('saveShiftToDb exception:', e); }
+}
+
+/** Delete a shift row from Supabase */
+async function deleteShiftFromDb(id) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { error } = await client.from('shifts').delete().eq('id', id);
+    if (error) console.error('deleteShiftFromDb error:', error.message);
+  } catch(e) { console.error('deleteShiftFromDb exception:', e); }
+}
+
+/** Load all event_types from Supabase (merges with built-ins) */
+async function loadEventTypes() {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { data, error } = await client
+      .from('event_types')
+      .select('value, label, member_visible')
+      .order('created_at', { ascending: true });
+    if (error) { console.error('loadEventTypes error:', error.message); return; }
+    // Store custom types (non-built-in) from DB into localStorage for compatibility
+    const builtInValues = BUILT_IN_EVENT_TYPES.map(t => t.value);
+    const custom = (data || []).filter(t => !builtInValues.includes(t.value));
+    saveCustomEventTypes(custom.map(t => ({ value: t.value, label: t.label, memberVisible: t.member_visible })));
+  } catch(e) { console.error('loadEventTypes exception:', e); }
+}
+
+/** Write a new custom event type to Supabase */
+async function saveEventTypeToDb(typeObj) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { error } = await client.from('event_types').insert([{
+      value:          typeObj.value,
+      label:          typeObj.label,
+      member_visible: typeObj.memberVisible !== false,
+    }]);
+    if (error) console.error('saveEventTypeToDb error:', error.message);
+  } catch(e) { console.error('saveEventTypeToDb exception:', e); }
+}
+
+/** Load all sms_threads + their messages from Supabase into SMS_THREADS */
+async function loadSmsThreads() {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { data: threads, error: tErr } = await client
+      .from('sms_threads')
+      .select('*')
+      .order('updated_at', { ascending: false });
+    if (tErr) { console.error('loadSmsThreads error:', tErr.message); return; }
+    if (!threads || threads.length === 0) return;
+
+    // Load all messages for these threads in one query
+    const threadIds = threads.map(t => t.id);
+    const { data: msgs, error: mErr } = await client
+      .from('thread_messages')
+      .select('*')
+      .in('thread_id', threadIds)
+      .order('sent_at', { ascending: true });
+    if (mErr) console.error('loadSmsThreads messages error:', mErr.message);
+
+    const msgsByThread = {};
+    (msgs || []).forEach(m => {
+      if (!msgsByThread[m.thread_id]) msgsByThread[m.thread_id] = [];
+      msgsByThread[m.thread_id].push({
+        from:       m.from_role,
+        text:       m.text,
+        time:       new Date(m.sent_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        senderName: m.sender_name || undefined,
+      });
+    });
+
+    SMS_THREADS = threads.map(t => ({
+      id:                    t.id,
+      type:                  t.type,
+      threadName:            t.thread_name,
+      memberId:              t.member_id   || null,
+      memberName:            t.member_name || '',
+      memberPhone:           t.member_phone || null,
+      privateParticipantId:  t.private_participant_id   || null,
+      privateParticipantRole:t.private_participant_role || null,
+      staffRole:             t.staff_role  || null,
+      section:               t.section     || null,
+      tableNum:              t.table_num   || null,
+      isSecurityAlert:       t.is_security_alert || false,
+      tag:                   t.tag         || 'GENERAL',
+      recipientRoles:        t.recipient_roles || [],
+      reservationId:         t.reservation_id  || null,
+      waitressId:            t.waitress_id     || null,
+      waitressName:          t.waitress_name   || null,
+      messages:              msgsByThread[t.id] || [],
+    }));
+  } catch(e) { console.error('loadSmsThreads exception:', e); }
+}
+
+/** Write a new thread to Supabase, then write its initial messages */
+async function saveSmsThreadToDb(thread) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { error } = await client.from('sms_threads').insert([{
+      id:                      thread.id,
+      type:                    thread.type,
+      thread_name:             thread.threadName   || null,
+      member_id:               thread.memberId     || null,
+      member_name:             thread.memberName   || null,
+      member_phone:            thread.memberPhone  || null,
+      private_participant_id:  thread.privateParticipantId   || null,
+      private_participant_role:thread.privateParticipantRole || null,
+      staff_role:              thread.staffRole    || null,
+      section:                 thread.section      || null,
+      table_num:               thread.tableNum     || null,
+      is_security_alert:       thread.isSecurityAlert || false,
+      tag:                     thread.tag          || 'GENERAL',
+      recipient_roles:         thread.recipientRoles || [],
+      reservation_id:          thread.reservationId || null,
+      waitress_id:             thread.waitressId   || null,
+      waitress_name:           thread.waitressName || null,
+    }]);
+    if (error) { console.error('saveSmsThreadToDb error:', error.message); return; }
+    // Write initial messages
+    if (thread.messages && thread.messages.length > 0) {
+      await appendMessagesToDb(thread.id, thread.messages);
+    }
+  } catch(e) { console.error('saveSmsThreadToDb exception:', e); }
+}
+
+/** Append one or more messages to thread_messages in Supabase */
+async function appendMessagesToDb(threadId, messages) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const rows = messages.map(m => ({
+      thread_id:   threadId,
+      from_role:   m.from,
+      text:        m.text,
+      sender_name: m.senderName || null,
+    }));
+    const { error } = await client.from('thread_messages').insert(rows);
+    if (error) console.error('appendMessagesToDb error:', error.message);
+    // Touch updated_at on the parent thread
+    await client.from('sms_threads').update({ updated_at: new Date().toISOString() }).eq('id', threadId);
+  } catch(e) { console.error('appendMessagesToDb exception:', e); }
+}
+
+/** Update thread fields in Supabase (e.g. type, tag, tableNum on sat) */
+async function updateSmsThreadInDb(id, fields) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const dbFields = { updated_at: new Date().toISOString() };
+    if (fields.type                    !== undefined) dbFields.type                     = fields.type;
+    if (fields.tag                     !== undefined) dbFields.tag                      = fields.tag;
+    if (fields.threadName              !== undefined) dbFields.thread_name              = fields.threadName;
+    if (fields.tableNum                !== undefined) dbFields.table_num                = fields.tableNum;
+    if (fields.waitressId              !== undefined) dbFields.waitress_id              = fields.waitressId;
+    if (fields.waitressName            !== undefined) dbFields.waitress_name            = fields.waitressName;
+    if (fields.recipientRoles          !== undefined) dbFields.recipient_roles          = fields.recipientRoles;
+    if (fields.isSecurityAlert         !== undefined) dbFields.is_security_alert        = fields.isSecurityAlert;
+    if (fields.privateParticipantId    !== undefined) dbFields.private_participant_id   = fields.privateParticipantId;
+    if (fields.privateParticipantRole  !== undefined) dbFields.private_participant_role = fields.privateParticipantRole;
+    const { error } = await client.from('sms_threads').update(dbFields).eq('id', id);
+    if (error) console.error('updateSmsThreadInDb error:', error.message);
+  } catch(e) { console.error('updateSmsThreadInDb exception:', e); }
+}
+
+/** Write an audit log entry */
+async function writeAuditLog(action, targetTable, targetId, newValue = null, oldValue = null) {
+  try {
+    const client = getDb();
+    if (!client) return;
+    const { error } = await client.from('audit_log').insert([{
+      actor_id:     currentMember?.id || null,
+      action,
+      target_table: targetTable,
+      target_id:    targetId  || null,
+      old_value:    oldValue  ? JSON.stringify(oldValue)  : null,
+      new_value:    newValue  ? JSON.stringify(newValue)  : null,
+    }]);
+    if (error) console.error('writeAuditLog error:', error.message);
+  } catch(e) { /* audit log failures are silent — never block the user action */ }
 }
 
 // ─── Security Helpers ─────────────────────────────────────
@@ -274,8 +633,10 @@ function getAllEventTypes() {
 function addCustomEventType(label) {
   const value = 'custom_' + label.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_' + Date.now().toString().slice(-4);
   const arr = getCustomEventTypes();
-  arr.push({ value, label, memberVisible: true });
+  const newType = { value, label, memberVisible: true };
+  arr.push(newType);
   saveCustomEventTypes(arr);
+  saveEventTypeToDb(newType);  // persist to Supabase
   return value;
 }
 
@@ -287,8 +648,20 @@ let STAFF_LIST = [];
 
 
 
-// Mock SMS threads (Phase 2: from Supabase/Twilio)
+// SMS threads — persisted to Supabase sms_threads + thread_messages tables
 let SMS_THREADS = [];
+
+/** Push a new thread to SMS_THREADS and persist to Supabase */
+function pushThread(thread) {
+  SMS_THREADS.push(thread);
+  saveSmsThreadToDb(thread);
+}
+
+/** Push a message to an existing thread and persist to Supabase */
+function pushMessage(thread, msgObj) {
+  thread.messages.push(msgObj);
+  appendMessagesToDb(thread.id, [msgObj]);
+}
 
 // ─── Thread Types (routing + bucketing) ──────────────────
 // Type drives who sees the thread and which inbox section it lands in.
@@ -1157,8 +1530,8 @@ function submitReservation() {
 
   const resId = 'RES' + Date.now().toString().slice(-5);
 
-  // Push to reservation queue
-  RESERVATION_QUEUE.push({
+  // Push to reservation queue and persist to Supabase
+  const newRes = {
     id:          resId,
     memberName:  currentMember?.name || 'Guest',
     memberId:    currentMember?.id,
@@ -1173,7 +1546,9 @@ function submitReservation() {
     requestedAt: Date.now(),
     tableAssigned: null,
     waitressAssigned: null,
-  });
+  };
+  RESERVATION_QUEUE.push(newRes);
+  saveReservationToDb(newRes);
 
   // Log a pending table sale attributed to promoter if applicable
   const tablePrice = PRICING.find(p => p.id === 'table-' + (parseInt(size) <= 2 ? '2' : parseInt(size) <= 4 ? '4' : 'vip'));
@@ -1593,9 +1968,9 @@ function sendStaffOwnerMessage() {
     t.privateParticipantId === currentLoggedStaffId
   );
   if (existing) {
-    existing.messages.push({ from: 'staff-member', text, time, senderName: staffName });
+    pushMessage(existing, { from: 'staff-member', text, time, senderName: staffName });
   } else {
-    SMS_THREADS.push({
+    pushThread({
       id:                   `PRIV-STAFF-${currentLoggedStaffId || currentStaffRole}-${Date.now()}`,
       type:                 'PRIVATE',
       threadName:           `Message with ${sanitizeHTML(staffName)}`,
@@ -1659,7 +2034,7 @@ function sendSecurityAlert() {
   if (!text) return showToast('Describe the situation first');
   const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
   const alertId = 'SEC-' + Date.now().toString().slice(-5);
-  SMS_THREADS.push({
+  pushThread({
     id: alertId,
     type: 'SECURITY',
     threadName: `Security Alert — ${time}`,
@@ -1691,7 +2066,7 @@ function sendNewThreadMessage() {
   const thread = SMS_THREADS.find(t => t.id === threadId);
   if (!thread) return showToast('Thread not found');
   const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-  thread.messages.push({ from: 'staff', text, time });
+  pushMessage(thread, { from: 'staff', text, time });
   // Push back to member's own thread
   if (thread.memberId) {
     const memberThread = getMemberThread(thread.memberId);
@@ -2010,7 +2385,8 @@ function archiveStaff(id) {
   const confirmed = window.confirm(`Archive ${sanitizeHTML(s.name)}? Their profile will be moved to inactive employees. Only you can remove it.`);
   if (!confirmed) return;
   STAFF_LIST = STAFF_LIST.filter(s => s.id !== id);
-  // Phase 2: move to archived_staff table in Supabase
+  updateStaffInDb(id, { active: false });
+  writeAuditLog('staff_archived', 'staff', id, { active: false }, { name: s.name, role: s.role });
   renderOwnerStaff();
   showToast(`${sanitizeHTML(s.name)} archived`);
 }
@@ -2091,7 +2467,9 @@ function addShift(ctx) {
 
   const staff = STAFF_LIST.find(s => s.id === staffId);
   const id    = 'SH' + Date.now();
-  SCHEDULE.push({ id, staffId, dateKey, startTime, endTime, role: staff?.role || '', note: note || '' });
+  const newShift = { id, staffId, dateKey, startTime, endTime, role: staff?.role || '', note: note || '' };
+  SCHEDULE.push(newShift);
+  saveShiftToDb(newShift);
 
   // Mirror into VENUE_EVENTS calendar
   if (!VENUE_EVENTS[dateKey]) VENUE_EVENTS[dateKey] = [];
@@ -2115,6 +2493,7 @@ function removeShift(shiftId, ctx) {
   const sh = SCHEDULE.find(s => s.id === shiftId);
   if (!sh) return;
   SCHEDULE = SCHEDULE.filter(s => s.id !== shiftId);
+  deleteShiftFromDb(shiftId);
   if (VENUE_EVENTS[sh.dateKey]) {
     VENUE_EVENTS[sh.dateKey] = VENUE_EVENTS[sh.dateKey].filter(
       e => !(e.type === 'shift' && e.staffId === sh.staffId && e.time === `${sh.startTime}–${sh.endTime}`)
@@ -3015,9 +3394,9 @@ function ownerSendNewCompose() {
       t.privateParticipantId === ownerComposeTarget.id
     );
     if (existing) {
-      existing.messages.push({ from: 'staff', text, time }); // 'staff' here = owner reply
+      pushMessage(existing, { from: 'staff', text, time }); // 'staff' here = owner reply
     } else {
-      SMS_THREADS.push({
+      pushThread({
         id:                   `PRIV-STAFF-${ownerComposeTarget.id}-${Date.now()}`,
         type:                 'PRIVATE',
         threadName:           `Message with ${sanitizeHTML(staffName)}`,
@@ -3051,7 +3430,7 @@ function ownerSendReply(threadId) {
   const thread = SMS_THREADS.find(t => t.id === threadId);
   const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
   if (thread) {
-    thread.messages.push({ from: 'staff', text: input.value.trim(), time });
+    pushMessage(thread, { from: 'staff', text: input.value.trim(), time });
     // Push reply back to member's concierge thread if this is a member thread
     if (thread.memberId && thread.privateParticipantRole !== 'staff') {
       getMemberThread(thread.memberId).push({ from: 'staff', text: input.value.trim(), time });
@@ -3066,7 +3445,15 @@ async function renderOwnerDashboard() {
   if (!db && typeof supabase !== 'undefined') {
     try { db = supabase.createClient(SUPABASE_URL, SUPABASE_ANON); } catch(e) {}
   }
-  await loadMembers();
+  // Load all persisted data from Supabase in parallel
+  await Promise.all([
+    loadMembers(),
+    loadStaff(),
+    loadReservations(),
+    loadShifts(),
+    loadEventTypes(),
+    loadSmsThreads(),
+  ]);
   const now = new Date();
   const startOfToday  = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const startOfMonth  = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -3731,9 +4118,9 @@ function pushToStaffThread(member, text, tag, recipientRoles, time, fromType, fo
       t.privateParticipantRole === 'member'
     );
     if (existing) {
-      existing.messages.push({ from, text, time });
+      pushMessage(existing, { from, text, time });
     } else {
-      SMS_THREADS.push({
+      pushThread({
         id:                   `PRIV-${member.id}-${Date.now()}`,
         type:                 'PRIVATE',
         threadName:           `Message with ${sanitizeHTML(member.name)}`,
@@ -3759,7 +4146,7 @@ function pushToStaffThread(member, text, tag, recipientRoles, time, fromType, fo
     ((t.type === type) || (!t.type && t.tag === tag))
   );
   if (existing) {
-    existing.messages.push({ from, text, time });
+    pushMessage(existing, { from, text, time });
     if (!existing.type) {
       existing.type = type;
       existing.threadName = defaultThreadNameForType(type, member.name, existing.tableNum);
@@ -3772,7 +4159,7 @@ function pushToStaffThread(member, text, tag, recipientRoles, time, fromType, fo
     }
   } else {
     const roles = recipientRoles || defaultRecipientRolesForType(type);
-    SMS_THREADS.push({
+    pushThread({
       id:             `M-${member.id}-${type}-${Date.now()}`,
       type,
       threadName:     defaultThreadNameForType(type, member.name, null),
@@ -3827,7 +4214,7 @@ function sendSMSReply(threadId) {
   if (!thread) return;
   const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
   const text = input.value.trim();
-  thread.messages.push({ from: 'staff', text, time });
+  pushMessage(thread, { from: 'staff', text, time });
   input.value = '';
   // Push reply back into the member's own thread (not for staff-to-staff PRIVATE threads)
   if (thread.memberId && thread.privateParticipantRole !== 'staff') {
@@ -4199,11 +4586,11 @@ function logSaleAndFireThread(sale) {
     // Mirror into SMS_THREADS so staff can reply
     const existingThread = SMS_THREADS.find(t => t.memberId === sale.memberId && t.type === 'RESERVATION');
     if (existingThread) {
-      existingThread.messages.push({ from: 'staff', text: msg, time });
+      pushMessage(existingThread, { from: 'staff', text: msg, time });
       if (sale.tableAssigned) existingThread.tableNum = sale.tableAssigned;
       existingThread.promoterId = sale.promoterId || existingThread.promoterId;
     } else {
-      SMS_THREADS.push({
+      pushThread({
         id:             `M-${sale.memberId}-RES`,
         type:           'RESERVATION',
         threadName:     `Reservation — ${sanitizeHTML(sale.memberName)}`,
@@ -4360,7 +4747,7 @@ function staffMarkTableSat(resId, role) {
     sThread.waitressId   = waitress.id;
     sThread.waitressName = waitress.name;
     sThread.recipientRoles = ['owner', 'barback'];
-    sThread.messages.push({
+    pushMessage(sThread, {
       from: 'internal',
       text: `🪑 Table ${res.tableAssigned} sat. ${sanitizeHTML(waitress.name)} assigned as server. Barbacks notified.`,
       time
@@ -4568,7 +4955,7 @@ function openWalkInTableAssign(member, context, role) {
   const dateKey = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
 
   // Push as confirmed so the floor plan & waitress assign panel appear
-  RESERVATION_QUEUE.push({
+  const walkInRes = {
     id: resId,
     memberName:  member.name,
     memberId:    member.id,
@@ -4584,7 +4971,9 @@ function openWalkInTableAssign(member, context, role) {
     tableAssigned: null,
     waitressAssigned: null,
     isWalkIn:    true,
-  });
+  };
+  RESERVATION_QUEUE.push(walkInRes);
+  saveReservationToDb(walkInRes);
 
   showToast(`${member.name} added — assign table below`);
 
@@ -4691,6 +5080,8 @@ function acceptReservation(resId) {
   if (!res) return;
   res.tableAssigned = document.getElementById(`res-table-${resId}`)?.value?.trim() || null;
   res.status = 'confirmed';
+  updateReservationInDb(resId, { status: 'confirmed', tableAssigned: res.tableAssigned });
+  writeAuditLog('reservation_accepted', 'reservations', resId, { status: 'confirmed' });
 
   // Write to VENUE_EVENTS so it appears on owner/manager/vip-host calendar
   if (!VENUE_EVENTS[res.dateKey]) VENUE_EVENTS[res.dateKey] = [];
@@ -4724,10 +5115,10 @@ function acceptReservation(resId) {
     if (existing) {
       existing.tableNum = res.tableAssigned || existing.tableNum;
       existing.threadName = `Reservation — ${sanitizeHTML(res.memberName)}`;
-      existing.messages.push({ from: 'staff', text: confirmMsg, time });
+      pushMessage(existing, { from: 'staff', text: confirmMsg, time });
       existing.recipientRoles = ['owner','manager','vip-host'];
     } else {
-      SMS_THREADS.push({
+      pushThread({
         id: `M-${res.memberId}-RES`, memberId: res.memberId,
         type: 'RESERVATION',
         threadName: `Reservation — ${sanitizeHTML(res.memberName)}`,
@@ -4751,7 +5142,7 @@ function acceptReservation(resId) {
   if (sThread) {
     const time2 = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
     const internalMsg = `📋 TEAM: Reservation accepted for ${sanitizeHTML(res.memberName)} — ${res.partySize} pax${res.tableAssigned ? ', ' + res.tableAssigned : ''}. ${res.occasion !== 'General visit' ? 'Occasion: ' + res.occasion + '.' : ''} VIP Host & Manager notified.${res.notes ? ' Notes: "' + res.notes + '"' : ''}`;
-    sThread.messages.push({ from: 'internal', text: internalMsg, time: time2 });
+    pushMessage(sThread, { from: 'internal', text: internalMsg, time: time2 });
   }
 
   showToast(`Reservation accepted${notified ? ' · ' + notified + ' notified' : ''}`);
@@ -4779,6 +5170,8 @@ function markTableSat(resId) {
   res.waitressAssigned = waitressId;
   res.tableAssigned    = tableNum.toString();
   res.status           = 'sat';
+  updateReservationInDb(resId, { status: 'sat', tableAssigned: tableNum.toString(), waitressAssigned: waitressId });
+  writeAuditLog('table_sat', 'reservations', resId, { status: 'sat', tableAssigned: tableNum, waitressAssigned: waitressId });
 
   const waitress = STAFF_LIST.find(s => s.id === waitressId);
   const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
@@ -4811,7 +5204,8 @@ function markTableSat(resId) {
     sThread.waitressName = waitress.name;
     // FLOOR recipientRoles: owner + all barbacks (specific IDs for barbacks, role for fallback)
     sThread.recipientRoles = ['owner', 'barback'];
-    sThread.messages.push({
+    updateSmsThreadInDb(sThread.id, { type: 'FLOOR', tag: 'FLOOR', threadName: sThread.threadName, tableNum: sThread.tableNum, waitressId: waitress.id, waitressName: waitress.name, recipientRoles: ['owner','barback'] });
+    pushMessage(sThread, {
       from: 'internal',
       text: `🪑 Table ${res.tableAssigned} sat. ${sanitizeHTML(waitress.name)} is assigned as server. Barbacks notified.`,
       time
@@ -4842,7 +5236,13 @@ function declineReservation(resId) {
     if (calIdx >= 0) VENUE_EVENTS[res.dateKey].splice(calIdx, 1);
   }
   const idx = RESERVATION_QUEUE.findIndex(r => r.id === resId);
-  if (idx >= 0) { RESERVATION_QUEUE.splice(idx, 1); showToast('Reservation declined'); renderOwnerReservations(); }
+  if (idx >= 0) {
+    RESERVATION_QUEUE.splice(idx, 1);
+    updateReservationInDb(resId, { status: 'declined' });
+    writeAuditLog('reservation_declined', 'reservations', resId, { status: 'declined' });
+    showToast('Reservation declined');
+    renderOwnerReservations();
+  }
 }
 
 // ─── Tickets & Pricing (Owner) ────────────────────────────
@@ -5161,9 +5561,13 @@ function addStaffMember() {
 
   const id = 'S' + String(Date.now()).slice(-6);
   if (role === 'promoter') {
-    PROMOTER_LIST.push({ id, name, phone, active: true, guestList: [], nights: [] });
+    const newPromoter = { id, name, phone, active: true, guestList: [], nights: [] };
+    PROMOTER_LIST.push(newPromoter);
+    saveStaffToDb({ id, name, phone, role: 'promoter', active: true, section: null });
   } else {
-    STAFF_LIST.push({ id, name, role, phone, active: true, section: null });
+    const newStaff = { id, name, role, phone, active: true, section: null };
+    STAFF_LIST.push(newStaff);
+    saveStaffToDb(newStaff);
   }
   document.getElementById('new-staff-name').value = '';
   document.getElementById('new-staff-role').value = '';
