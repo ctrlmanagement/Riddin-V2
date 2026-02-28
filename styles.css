@@ -675,6 +675,8 @@ body:not([data-theme="light"]) .logo-main {
   transition: border-color 0.2s;
 }
 .metric-card:hover { border-color: var(--accent); }
+.metric-card[data-card] { cursor: pointer; }
+.metric-card.card-active { border-color: var(--accent) !important; background: rgba(212,175,55,0.06); }
 
 .metric-val { font-size: 36px; font-weight: 300; color: var(--accent); line-height: 1; }
 .metric-label { font-family: 'Space Mono', monospace; font-size: 10px; color: var(--muted); margin-top: 8px; }
